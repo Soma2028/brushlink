@@ -25,6 +25,13 @@ def main() -> int:
     # 未選択なら全件が返ること
     assert len(charts.apply_selection(ds.df, None)) == ds.n_rows
 
+    # 散布図が初期状態から box_select でドラッグ選択できること
+    sc = charts.scatter(ds.df, "温度", "収率")
+    plot_opts = hv.Store.lookup_options("bokeh", sc, "plot").kwargs
+    print(f"[1.5] 散布図ツール: tools={plot_opts.get('tools')} active_tools={plot_opts.get('active_tools')}")
+    assert "box_select" in plot_opts.get("tools", [])
+    assert "active_tools" in plot_opts and plot_opts["active_tools"] == ["box_select"]
+
     # 散布図のドラッグ選択に相当する条件を直接組み立てて適用する
     expr = (hv.dim("温度") > 100) & (hv.dim("収率") > 80)
     sub = charts.apply_selection(ds.df, expr)

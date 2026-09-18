@@ -18,7 +18,11 @@ def new_linker() -> hv.selection.link_selections:
 
 
 def scatter(df: pd.DataFrame, x: str, y: str, by: str | None = None):
-    """主役の散布図。ここをドラッグして範囲選択する。"""
+    """主役の散布図。ここをドラッグして範囲選択する。
+
+    デフォルトツールが pan だとドラッグしてもパンするだけで選択できないため、
+    box_select を初期状態からアクティブにしておく（lasso も併用可能にする）。
+    """
     return df.hvplot.scatter(
         x=x,
         y=y,
@@ -28,6 +32,9 @@ def scatter(df: pd.DataFrame, x: str, y: str, by: str | None = None):
         height=380,
         responsive=True,
         legend="top_right",
+    ).opts(
+        tools=["box_select", "lasso_select", "hover"],
+        active_tools=["box_select"],
     )
 
 
