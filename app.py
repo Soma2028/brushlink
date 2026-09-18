@@ -1,4 +1,4 @@
-"""Spotfire 風クロスフィルタ・ダッシュボード。
+"""Brushlink — TIBCO Spotfire に着想を得たクロスフィルタ・ダッシュボード。
 
 起動:
     panel serve app.py --show
@@ -100,7 +100,7 @@ def model_view(_clicks):
 # レイアウト
 # ---------------------------------------------------------------
 pn.template.FastListTemplate(
-    title="Spotfire Lite",
+    title="Brushlink",
     sidebar=[
         pn.pane.Markdown("### 表示設定"),
         x_sel,
