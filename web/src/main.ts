@@ -24,6 +24,8 @@ import {
   plot,
   dot,
   rectY,
+  raster,
+  hexbin,
   intervalX,
   intervalXY,
   loadCSV,
@@ -31,12 +33,16 @@ import {
   height,
 } from '@uwdata/vgplot';
 
+type MarkKind = 'dot' | 'raster' | 'hexbin';
+
 // --- 計測結果。Playwright など外部の driver から読めるよう window に生やす ---
 interface Metrics {
   n: number;
   genMs: number | null;
   loadMs: number | null;
+  markKind: MarkKind;
   firstRenderMs: number | null;
+  scatterDomNodes: number | null;
   memBaselineBytes: number | null;
   memAfterLoadBytes: number | null;
   memAfterRenderBytes: number | null;
@@ -51,7 +57,9 @@ const metrics: Metrics = {
   n: 0,
   genMs: null,
   loadMs: null,
+  markKind: 'dot',
   firstRenderMs: null,
+  scatterDomNodes: null,
   memBaselineBytes: memSnapshot(),
   memAfterLoadBytes: null,
   memAfterRenderBytes: null,
@@ -70,9 +78,34 @@ function getRowCountFromUrl(): number {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 300;
 }
 
+// dot（1点=1DOMノード）と、DuckDB 側で集計してから描く raster / hexbin を
+// 切り替えて比較する。専用 UI は作らず ?mark= のみで切り替える。
+function getMarkKindFromUrl(): MarkKind {
+  const raw = new URLSearchParams(location.search).get('mark');
+  return raw === 'raster' || raw === 'hexbin' ? raw : 'dot';
+}
+
+// 散布図側に使うマーク本体を組み立てる。dot 以外は DuckDB 側で
+// グリッド/ヘキサゴン単位に集計してから描画するため、DOM ノード数が
+// 行数から切り離されることを比較したい。
+function buildScatterMark(kind: MarkKind, filterBy: ReturnType<typeof Selection.crossfilter>) {
+  const source = from('points', { filterBy });
+  switch (kind) {
+    case 'raster':
+      return raster(source, { x: 'x', y: 'y' });
+    case 'hexbin':
+      return hexbin(source, { x: 'x', y: 'y', fill: count(), binWidth: 10 });
+    case 'dot':
+    default:
+      return dot(source, { x: 'x', y: 'y', fill: 'group' });
+  }
+}
+
 document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
   <h1>Brushlink — Web 版 技術検証（データ量の限界計測）</h1>
-  <p>行数は URL パラメータで切り替える（例: <code>?n=100000</code>）。既定は 300 行。</p>
+  <p>行数・マーク種別は URL パラメータで切り替える
+     （例: <code>?n=1000000&amp;mark=raster</code>）。既定は 300 行 / dot。
+     mark は dot / raster / hexbin。</p>
   <div id="status"></div>
   <p>選択中: <span id="count">-</span></p>
   <div id="plots"></div>
@@ -128,8 +161,10 @@ function waitForFirstSvg(target: Element, timeoutMs = 180_000): Promise<number> 
 
 async function main() {
   const n = getRowCountFromUrl();
+  const markKind = getMarkKindFromUrl();
   metrics.n = n;
-  log(`行数: ${n.toLocaleString()}`);
+  metrics.markKind = markKind;
+  log(`行数: ${n.toLocaleString()} / マーク: ${markKind}`);
 
   // --- 1. DuckDB-WASM の初期化 + CSV 読み込み + SELECT -------------------
   log('[1] DuckDB-WASM を初期化中…');
@@ -158,11 +193,11 @@ async function main() {
   log(`[1] OK: SELECT COUNT(*) FROM points -> ${totalRows} 行`);
 
   // --- 2. 散布図 + ヒストグラムを、共有 Selection で範囲選択連動させる -----
-  log('[2] 散布図・ヒストグラムを描画し、範囲選択を連動させます…');
+  log(`[2] 散布図（${markKind}）・ヒストグラムを描画し、範囲選択を連動させます…`);
   const $brush = Selection.crossfilter();
 
   const scatter = plot(
-    dot(from('points', { filterBy: $brush }), { x: 'x', y: 'y', fill: 'group' }),
+    buildScatterMark(markKind, $brush),
     intervalXY({ as: $brush }),
     width(360),
     height(300)
@@ -186,8 +221,10 @@ async function main() {
   try {
     const firstRenderMs = await firstRenderPromise;
     metrics.firstRenderMs = firstRenderMs;
+    metrics.scatterDomNodes = scatter.querySelectorAll('*').length;
     metrics.memAfterRenderBytes = memSnapshot();
     log(`[計測] 初回の散布図描画: ${firstRenderMs.toFixed(1)} ms`);
+    log(`[計測] 散布図のDOMノード数: ${metrics.scatterDomNodes.toLocaleString()}`);
     log('[2] OK: 散布図・ヒストグラムを描画しました（ドラッグで範囲選択を確認）');
   } catch (e) {
     log(`[2] ✗ 初回描画がタイムアウトしました: ${e instanceof Error ? e.message : e}`);
