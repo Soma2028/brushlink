@@ -14,7 +14,7 @@ import param
 
 from src import charts, data, filters, r_bridge
 
-pn.extension("tabulator", sizing_mode="stretch_width")
+pn.extension("tabulator", "filedropper", sizing_mode="stretch_width")
 charts.hv.extension("bokeh")
 
 # ---------------------------------------------------------------
@@ -68,6 +68,7 @@ _last_upload: tuple[str, bytes | str] | None = None
 # --- フィルタパネル -------------------------------------------------
 filter_panel = filters.build(ds)
 filter_box = pn.Column(*filter_panel.widgets())
+filter_exclusion_note = pn.pane.Markdown("", margin=(0, 0, 5, 0))
 
 
 def _watch_filter_panel(panel: filters.FilterPanel) -> None:
@@ -76,7 +77,24 @@ def _watch_filter_panel(panel: filters.FilterPanel) -> None:
         w.param.watch(state.bump, "value")
 
 
+def _update_filter_exclusion_note() -> None:
+    """高カーディナリティ列を除外した旨をサイドバーに 1 行出す。
+
+    除外自体は data._finalize() が ds.high_card_cols として既にやっている
+    （filters.build/c_sel は ds.cat_cols しか見ないので自動的に対象外になる）。
+    ここでは「なぜ選択肢に出てこないのか」が分かるよう、理由を可視化するだけ。
+    """
+    if not ds.high_card_cols:
+        filter_exclusion_note.object = ""
+        return
+    names = "、".join(f"{c}（{ds.df[c].nunique():,}種）" for c in ds.high_card_cols)
+    filter_exclusion_note.object = (
+        f"⚠️ 高カーディナリティ列をフィルタ・色分けから除外: {names}"
+    )
+
+
 _watch_filter_panel(filter_panel)
+_update_filter_exclusion_note()
 
 
 def filtered_df():
@@ -101,6 +119,7 @@ def _reload(new_ds) -> None:
     filter_panel = filters.build(ds)
     _watch_filter_panel(filter_panel)
     filter_box[:] = filter_panel.widgets()
+    _update_filter_exclusion_note()
 
     # x_sel/y_sel/c_sel は別々のウィジェット（＝別々の Parameterized インスタンス）
     # なので、1 つずつ .value を更新すると「x だけ新列・y はまだ旧列」という
@@ -181,13 +200,30 @@ def stats_view(_version, expr):
     fdf = filtered_df()
     sub = charts.apply_selection(fdf, expr)
     ratio = len(sub) / len(fdf) * 100 if len(fdf) else 0.0
+
+    # mean/std/min/max は pandas の既定（skipna=True）で欠測を自動的に無視する
+    # ため NaN にはならないが、「無視された件数」自体は見えない。
+    # 研究室データでは測定漏れが常態なので、列ごとの欠測件数を明示する。
     summary = sub[ds.num_cols].agg(["mean", "std", "min", "max"]).T.round(2)
+    summary["欠測"] = sub[ds.num_cols].isna().sum()
+
+    # 選択の有無に関わらず、母集団全体（数値・カテゴリ問わず）の欠測も出す。
+    # ドラッグ選択する前から欠測の多さに気づけるようにするため。
+    missing = fdf.isna().sum()
+    missing = missing[missing > 0]
+    if missing.empty:
+        missing_note = "欠測: なし（母集団内）"
+    else:
+        detail = "、".join(f"{col}: {n:,} 件" for col, n in missing.items())
+        missing_note = f"⚠️ 欠測（母集団 {len(fdf):,} 件中）: {detail}"
+
     return pn.Column(
         pn.pane.Markdown(
             f"#### 選択中 {len(sub):,} / 母集団 {len(fdf):,} 件 ({ratio:.1f}%) "
             f"— 全体 {ds.n_rows:,} 件"
         ),
         pn.widgets.Tabulator(summary, disabled=True, height=190),
+        pn.pane.Markdown(missing_note, margin=(5, 0, 0, 0)),
     )
 
 
@@ -245,6 +281,7 @@ pn.template.FastListTemplate(
             "### フィルタ\n"
             "母集団そのものを絞り込みます（チャートの選択とは別系統）。"
         ),
+        filter_exclusion_note,
         filter_box,
         pn.layout.Divider(),
         pn.pane.Markdown("### 分析"),

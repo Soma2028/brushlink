@@ -20,6 +20,13 @@ import pandas as pd
 TABLE = "t"  # アプリ内で扱う論理テーブル名
 UPLOAD_SUFFIXES = (".csv", ".xlsx", ".xls")  # 画面からのアップロードで受け付ける拡張子
 
+# チェックボックス・色分けの対象から外す、カテゴリ列の最大ユニーク値数。
+# 根拠: Bokeh の既定カテゴリパレット Category20 が持つ色数（20）。
+# これを超えると色分けは色が循環してしまい区別の用をなさず、
+# チェックボックスも縦に長くなって一覧性を失う。ID列・日付列のような
+# 高カーディナリティ列を自動的にフィルタ・色分けの対象外にするための閾値。
+MAX_CATEGORY_CARDINALITY = 20
+
 
 class LoadError(ValueError):
     """データ読み込みの失敗。メッセージはそのまま画面に出せる日本語にする。
@@ -38,6 +45,9 @@ class DataSource:
     df: pd.DataFrame
     num_cols: list[str] = field(default_factory=list)
     cat_cols: list[str] = field(default_factory=list)
+    # カーディナリティが MAX_CATEGORY_CARDINALITY を超えたため cat_cols から
+    # 除外した列。フィルタ・色分けの対象外だが、列自体は df に残っている。
+    high_card_cols: list[str] = field(default_factory=list)
 
     @property
     def n_rows(self) -> int:
@@ -77,7 +87,7 @@ def _finalize(con: duckdb.DuckDBPyConnection, df: pd.DataFrame) -> DataSource:
     数値列が 2 つ未満だと散布図が描けないため、ここで弾いて理由を返す。
     """
     num_cols = df.select_dtypes("number").columns.tolist()
-    cat_cols = [c for c in df.columns if c not in num_cols]
+    all_cat_cols = [c for c in df.columns if c not in num_cols]
 
     if len(num_cols) < 2:
         raise LoadError(
@@ -85,7 +95,16 @@ def _finalize(con: duckdb.DuckDBPyConnection, df: pd.DataFrame) -> DataSource:
             "区切り文字やヘッダ行の指定が正しいか確認してください。"
         )
 
-    return DataSource(con=con, df=df, num_cols=num_cols, cat_cols=cat_cols)
+    # ID列・日付列などはユニーク値が多く、チェックボックスにも色分けにも向かない。
+    # cat_cols からは外し、high_card_cols 側に回す（画面には除外した旨を表示する）。
+    high_card_cols = [
+        c for c in all_cat_cols if df[c].nunique(dropna=True) > MAX_CATEGORY_CARDINALITY
+    ]
+    cat_cols = [c for c in all_cat_cols if c not in high_card_cols]
+
+    return DataSource(
+        con=con, df=df, num_cols=num_cols, cat_cols=cat_cols, high_card_cols=high_card_cols
+    )
 
 
 def load(path: str | Path | None = None, n_rows: int = 20_000) -> DataSource:

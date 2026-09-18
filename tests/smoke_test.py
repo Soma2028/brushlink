@@ -124,6 +124,61 @@ def main() -> int:
     except data.LoadError as e:
         print(f"[5.7] 数値列不足エラー: {e}")
 
+    # --- 高カーディナリティ列の除外 -------------------------------------
+    # ID 列のような「ほぼ全行ユニーク」な列はチェックボックス・色分けに
+    # 向かないので、cat_cols/フィルタ/色分けの対象から外れることを検証する。
+    n = data.MAX_CATEGORY_CARDINALITY + 5
+    high_card_df = pd.DataFrame(
+        {
+            "値": range(n),
+            "測定値": [float(i % 7) for i in range(n)],
+            "ID": [f"S{i:04d}" for i in range(n)],  # 全行ユニーク -> 高カーディナリティ
+            "区分": ["A", "B"] * (n // 2) + ["A"] * (n % 2),  # 低カーディナリティ
+        }
+    )
+    hc_ds = data.load_from_upload("high_card.csv", high_card_df.to_csv(index=False), header_row=0)
+    print(f"[6] 高カーディナリティ: cat_cols={hc_ds.cat_cols} high_card_cols={hc_ds.high_card_cols}")
+    assert "ID" in hc_ds.high_card_cols, "高カーディナリティ列が検出されていません"
+    assert "ID" not in hc_ds.cat_cols, "高カーディナリティ列が cat_cols に残っています"
+    assert "区分" in hc_ds.cat_cols, "低カーディナリティ列まで除外されています"
+
+    hc_fp = filters.build(hc_ds)
+    assert "ID" not in hc_fp.cat_widgets, "高カーディナリティ列のフィルタウィジェットができています"
+    assert len(filters.apply(hc_ds.df, hc_fp)) == hc_ds.n_rows
+
+    # --- 欠測の扱い -------------------------------------------------
+    # between()/isin() は NaN に対して False を返すため、対策していないと
+    # 「フィルタを一切操作していないのに欠測行だけ母集団から消える」バグになる。
+    miss_df = pd.DataFrame(
+        {
+            "x": [1.0, 2.0, None, 4.0, 5.0],
+            "y": [10.0, None, 30.0, 40.0, 50.0],
+            "区分": ["A", "B", "A", "B", "A"],
+        }
+    )
+    miss_ds = data.load_from_upload("missing.csv", miss_df.to_csv(index=False), header_row=0)
+    miss_fp = filters.build(miss_ds)
+    miss_full = filters.apply(miss_ds.df, miss_fp)
+    print(f"[7] 欠測データ: フィルタ初期状態 {len(miss_full)} / {miss_ds.n_rows} 行")
+    assert len(miss_full) == miss_ds.n_rows, "欠測行が初期状態のフィルタで消えています"
+
+    # 数値レンジを狭めても、欠測行は（判定不能として）通ったままであること
+    lo, hi = miss_fp.num_widgets["x"].start, miss_fp.num_widgets["x"].end
+    miss_fp.num_widgets["x"].value = (lo, lo)  # x==1.0 の行だけに絞る
+    narrowed = filters.apply(miss_ds.df, miss_fp)
+    print(f"[7.1] x を先頭値だけに絞り込み: {len(narrowed)} 行（x が欠測の行は通る）")
+    assert narrowed["x"].isna().sum() == 1, "欠測行がレンジ絞り込みで消えています"
+    assert len(narrowed) == 2, "絞り込み結果の件数が想定と違います"  # x==1.0 の1件 + x欠測の1件
+
+    # 統計量の agg は pandas の既定（skipna=True）で欠測を無視して計算されること
+    summary = miss_ds.df[["x", "y"]].agg(["mean", "std", "min", "max"])
+    assert not summary.isna().any().any(), "mean/std/min/max が欠測で NaN になっています"
+
+    # 回帰は欠測行を落としたうえで、実際に使った件数を正しく報告すること
+    miss_fit = r_bridge.linear_model(miss_ds.df, "x", "y")
+    print(f"[7.2] 欠測込みデータの回帰: 件数={miss_fit['件数'].iloc[0]}")
+    assert miss_fit["件数"].iloc[0] == 3, "回帰の使用件数が欠測除外後の件数と一致しません"
+
     print("\nすべて通りました。")
     return 0
 

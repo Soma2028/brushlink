@@ -73,11 +73,20 @@ def apply(df: pd.DataFrame, panel: FilterPanel) -> pd.DataFrame:
     ここでの絞り込み結果が以降のすべての描画・統計・回帰の入力になる。
     カテゴリのチェックを全部外した場合は「該当なし」として 0 件を返す
     （何も選ばれていない＝絞り込み無し、ではなく素直に空集合として扱う）。
+
+    欠測値（NaN）はレンジのどの範囲にも属さず、チェックボックスの選択肢にも
+    含まれない（build() で dropna 済み）。そのため between/isin をそのまま
+    使うと、フィルタを一切操作していなくても欠測を含む行だけ母集団から
+    消えてしまい、「初期状態は全件を通す」という設計が崩れる。
+    研究室データでは測定漏れが珍しくないため、欠測は「除外する理由がない」
+    として、レンジ・チェックボックスのどちらの条件も欠測なら通す扱いにする。
     """
     mask = pd.Series(True, index=df.index)
     for col, widget in panel.num_widgets.items():
         lo, hi = widget.value
-        mask &= df[col].between(lo, hi)
+        col_data = df[col]
+        mask &= col_data.between(lo, hi) | col_data.isna()
     for col, widget in panel.cat_widgets.items():
-        mask &= df[col].isin(widget.value)
+        col_data = df[col]
+        mask &= col_data.isin(widget.value) | col_data.isna()
     return df[mask]
