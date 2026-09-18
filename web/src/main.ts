@@ -1,9 +1,15 @@
 // ブラウザ内完結版の技術検証（Vite + TypeScript）。
-// 確認する3点だけに絞る:
+// 確認する3点:
 //   1. DuckDB-WASM の初期化 + CSV 読み込み + SELECT
 //   2. Mosaic での散布図・ヒストグラムの範囲選択連動
 //   3. 選択された行数の表示
-// 見た目・UI の作り込み・統計機能・Excel 対応はしない。
+// 加えて、データ量を増やしたときの限界を計測する（行数は ?n= で切り替え）:
+//   - CSV を DuckDB-WASM に登録し終わるまでの時間
+//   - 初回の散布図描画にかかる時間
+//   - ドラッグ選択に対する件数更新の応答時間（driver 側で計測、ここは時刻を晒すだけ）
+//   - ブラウザのメモリ使用量（performance.memory、Chrome 限定の概算値）
+// 見た目・UI の作り込み・統計機能・Excel 対応はしない。行数切り替えも
+// URL パラメータのみで、専用 UI は作らない。
 
 import './style.css';
 import { makeClient } from '@uwdata/mosaic-core';
@@ -25,9 +31,48 @@ import {
   height,
 } from '@uwdata/vgplot';
 
+// --- 計測結果。Playwright など外部の driver から読めるよう window に生やす ---
+interface Metrics {
+  n: number;
+  genMs: number | null;
+  loadMs: number | null;
+  firstRenderMs: number | null;
+  memBaselineBytes: number | null;
+  memAfterLoadBytes: number | null;
+  memAfterRenderBytes: number | null;
+  // ドラッグ選択の応答時間は driver 側が計測する。ここでは
+  // 「選択結果が反映された時刻」を performance.now() で晒すだけ
+  // （page/driver 間の時計ずれを避けるため、両方とも page 内の
+  // performance.now() で揃える）。
+  lastSelectionAppliedAt: number | null;
+}
+
+const metrics: Metrics = {
+  n: 0,
+  genMs: null,
+  loadMs: null,
+  firstRenderMs: null,
+  memBaselineBytes: memSnapshot(),
+  memAfterLoadBytes: null,
+  memAfterRenderBytes: null,
+  lastSelectionAppliedAt: null,
+};
+(window as any).__metrics = metrics;
+
+function memSnapshot(): number | null {
+  const m = (performance as any).memory;
+  return m ? m.usedJSHeapSize : null;
+}
+
+function getRowCountFromUrl(): number {
+  const raw = new URLSearchParams(location.search).get('n');
+  const n = raw ? Number(raw) : 300;
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 300;
+}
+
 document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
-  <h1>Brushlink — Web 版 技術検証</h1>
-  <p>DuckDB-WASM + Mosaic (vgplot) が動くかだけを確認する最小構成。</p>
+  <h1>Brushlink — Web 版 技術検証（データ量の限界計測）</h1>
+  <p>行数は URL パラメータで切り替える（例: <code>?n=100000</code>）。既定は 300 行。</p>
   <div id="status"></div>
   <p>選択中: <span id="count">-</span></p>
   <div id="plots"></div>
@@ -43,29 +88,68 @@ function log(line: string) {
 }
 
 // --- サンプル CSV をその場で生成する（外部ファイル取得を経路から外し、
-//     まず「DuckDB-WASM の初期化と SELECT が通るか」だけを最短で確認する） ---
-function makeSampleCsv(n = 300): string {
-  const rows = ['x,y,group'];
+//     「DuckDB-WASM への登録そのもの」の時間だけを計測できるようにする） ---
+function makeSampleCsv(n: number): { csv: string; genMs: number } {
+  const t0 = performance.now();
+  const rows = new Array<string>(n + 1);
+  rows[0] = 'x,y,group';
   for (let i = 0; i < n; i++) {
     const group = i % 3 === 0 ? 'A' : i % 3 === 1 ? 'B' : 'C';
     const x = Math.round((Math.random() * 100 + (group === 'A' ? 20 : 0)) * 100) / 100;
     const y = Math.round((x * 0.6 + Math.random() * 30) * 100) / 100;
-    rows.push(`${x},${y},${group}`);
+    rows[i + 1] = `${x},${y},${group}`;
   }
-  return rows.join('\n');
+  const csv = rows.join('\n');
+  return { csv, genMs: performance.now() - t0 };
+}
+
+// 対象要素の中に最初の <svg> が現れるまでの時間を計る（初回描画の完了とみなす）。
+function waitForFirstSvg(target: Element, timeoutMs = 180_000): Promise<number> {
+  const t0 = performance.now();
+  return new Promise((resolve, reject) => {
+    if (target.querySelector('svg')) {
+      resolve(performance.now() - t0);
+      return;
+    }
+    const timer = setTimeout(() => {
+      obs.disconnect();
+      reject(new Error(`初回描画が ${timeoutMs}ms 以内に終わりませんでした`));
+    }, timeoutMs);
+    const obs = new MutationObserver(() => {
+      if (target.querySelector('svg')) {
+        clearTimeout(timer);
+        obs.disconnect();
+        resolve(performance.now() - t0);
+      }
+    });
+    obs.observe(target, { childList: true, subtree: true });
+  });
 }
 
 async function main() {
+  const n = getRowCountFromUrl();
+  metrics.n = n;
+  log(`行数: ${n.toLocaleString()}`);
+
   // --- 1. DuckDB-WASM の初期化 + CSV 読み込み + SELECT -------------------
   log('[1] DuckDB-WASM を初期化中…');
   const connector = new DuckDBWASMConnector();
   const db = coordinator();
   db.databaseConnector(connector);
+  await connector.getDuckDB(); // ここで WASM 本体の初期化を先に済ませておく
+
+  const { csv: csvText, genMs } = makeSampleCsv(n);
+  metrics.genMs = genMs;
+  log(`[計測] CSV生成(JS側、参考値): ${genMs.toFixed(1)} ms`);
 
   const duckdb = await connector.getDuckDB();
-  const csvText = makeSampleCsv();
+  const tLoad0 = performance.now();
   await duckdb.registerFileText('points.csv', csvText);
   await db.exec(loadCSV('points', 'points.csv'));
+  const loadMs = performance.now() - tLoad0;
+  metrics.loadMs = loadMs;
+  metrics.memAfterLoadBytes = memSnapshot();
+  log(`[計測] DuckDB-WASM への登録: ${loadMs.toFixed(1)} ms`);
 
   const countRows: any = await db.query(
     Query.from('points').select({ n: count() })
@@ -95,9 +179,20 @@ async function main() {
     height(300)
   );
 
+  const firstRenderPromise = waitForFirstSvg(scatter);
   plotsEl.appendChild(scatter);
   plotsEl.appendChild(hist);
-  log('[2] OK: 散布図・ヒストグラムを描画しました（ドラッグで範囲選択を確認）');
+
+  try {
+    const firstRenderMs = await firstRenderPromise;
+    metrics.firstRenderMs = firstRenderMs;
+    metrics.memAfterRenderBytes = memSnapshot();
+    log(`[計測] 初回の散布図描画: ${firstRenderMs.toFixed(1)} ms`);
+    log('[2] OK: 散布図・ヒストグラムを描画しました（ドラッグで範囲選択を確認）');
+  } catch (e) {
+    log(`[2] ✗ 初回描画がタイムアウトしました: ${e instanceof Error ? e.message : e}`);
+    metrics.memAfterRenderBytes = memSnapshot();
+  }
 
   // --- 3. 選択された行数を画面に表示する ----------------------------------
   makeClient({
@@ -105,11 +200,13 @@ async function main() {
     selection: $brush,
     query: (filter) => Query.from('points').select({ n: count() }).where(filter),
     queryResult: (data: any) => {
-      const n = Number(data.get(0).n);
-      countEl.textContent = `${n} / ${totalRows} 行`;
+      const selected = Number(data.get(0).n);
+      countEl.textContent = `${selected} / ${totalRows} 行`;
+      metrics.lastSelectionAppliedAt = performance.now();
     },
   });
   log('[3] OK: 選択行数の表示クライアントを接続しました');
+  log('=== READY ===');
 }
 
 main().catch((err) => {
