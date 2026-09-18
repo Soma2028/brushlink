@@ -1,0 +1,21 @@
+/* 技術検証用の最小限のスタイル。見た目の作り込みはしない。 */
+body {
+  font-family: sans-serif;
+  margin: 1.5rem;
+}
+
+#status {
+  white-space: pre-line;
+  font-size: 0.9rem;
+  margin-bottom: 1rem;
+}
+
+#count {
+  font-weight: bold;
+}
+
+#plots {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
