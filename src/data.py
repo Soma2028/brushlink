@@ -130,35 +130,118 @@ def load(path: str | Path | None = None, n_rows: int = 20_000) -> DataSource:
     return _finalize(con, df)
 
 
-def load_from_upload(
-    filename: str, content: bytes | str, header_row: int = 0
-) -> DataSource:
-    """画面のドロップ領域からアップロードされたファイルをロードする。
-
-    - .csv / .xlsx / .xls に対応。判定はファイル名の拡張子で行う。
-    - header_row はヘッダ行の 0 始まりインデックス。1 行目がヘッダでない
-      実験データ（機器の出力など）があるため、呼び出し側で指定できるようにしてある。
-    - Panel の FileDropper は text 系ファイルを str に自動デコードして渡してくる
-      （バイナリの xlsx は bytes のまま）。両方を受けられるようにしている。
-    - 失敗時は LoadError（日本語メッセージ）に正規化する。
-      アップロードは形式違反や空ファイルが普通に起こるので、
-      ここで拾って呼び出し側がそのまま画面に出せるようにする。
-    """
+def _check_upload_suffix(filename: str) -> str:
+    """拡張子が対応形式かを確認し、小文字化した拡張子を返す。"""
     suffix = Path(filename).suffix.lower()
     if suffix not in UPLOAD_SUFFIXES:
         raise LoadError(
             f"対応していないファイル形式です: {filename}"
             f"（対応形式: {', '.join(UPLOAD_SUFFIXES)}）"
         )
+    return suffix
+
+
+def _upload_buffer(suffix: str, content: bytes | str) -> io.BytesIO | io.StringIO:
+    """アップロード内容を pandas に渡せるバッファにする。
+
+    Panel の FileDropper は text 系ファイルを str に自動デコードして渡してくる
+    （バイナリの xlsx は bytes のまま）。xlsx 側は必ずバイト列が要るため、
+    str で来ていたら utf-8 で符号化し直す。
+    """
+    if suffix in (".xlsx", ".xls"):
+        return io.BytesIO(content) if isinstance(content, bytes) else io.BytesIO(
+            content.encode("utf-8")
+        )
+    return io.StringIO(content) if isinstance(content, str) else io.BytesIO(content)
+
+
+def _cell_is_numeric(value: object) -> bool:
+    """プレビューの 1 セルが「数値っぽいか」を判定する。
+
+    xlsx は openpyxl がセルごとの元の型（int/float/str）を保持したまま
+    DataFrame になるが、CSV はヘッダ行をまだ決めていない生読み込みの段階では
+    列全体が object 型の文字列になる。数値型ならそのまま数値とみなし、
+    文字列は float() を試して数値らしさを判定することで両方に対応する。
+    """
+    if pd.isna(value):
+        return False
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        try:
+            float(value.strip())
+            return True
+        except ValueError:
+            return False
+    return False
+
+
+def _row_numeric_ratio(row: pd.Series) -> float:
+    """行の中で値がある（NaN でない）セルのうち、数値っぽいセルの割合。"""
+    values = [v for v in row.tolist() if pd.notna(v)]
+    if not values:
+        return 0.0
+    return sum(_cell_is_numeric(v) for v in values) / len(values)
+
+
+def preview_upload(filename: str, content: bytes | str, n_rows: int = 5) -> pd.DataFrame:
+    """ヘッダ行を決める前の、加工していない先頭 n_rows 行を返す。
+
+    型解釈（どの行をヘッダとして扱うか）を一切行わない生データで、
+    画面のプレビュー表示と guess_header_row() の両方の入力になる。
+    実際の読み込みは、ここで選んだ行を header_row として load_from_upload() に渡す。
+    """
+    suffix = _check_upload_suffix(filename)
+    try:
+        buf = _upload_buffer(suffix, content)
+        if suffix in (".xlsx", ".xls"):
+            raw = pd.read_excel(buf, header=None, nrows=n_rows)
+        else:
+            raw = pd.read_csv(buf, header=None, nrows=n_rows)
+    except Exception as e:
+        raise LoadError(f"「{filename}」の先頭行を読み取れませんでした: {e}") from e
+    return raw
+
+
+def guess_header_row(raw: pd.DataFrame) -> int:
+    """プレビュー行からヘッダ行らしい行を推定する。
+
+    「その行は文字列主体」かつ「次の行は数値主体」を満たす最初の行を採用する。
+    タイトル行・単位行を挟むデータでも、実際のヘッダの直後は必ずデータ行に
+    なることを利用している。見つからなければ 0 行目を既定にする。
+    これはあくまで初期値のヒント。最終判断は画面側でユーザーに委ねてあり、
+    推定が外れてもプレビュー表から別の行を選び直せば成立する設計にしてある。
+    """
+    for i in range(len(raw) - 1):
+        this_row_is_text = _row_numeric_ratio(raw.iloc[i]) < 0.5
+        next_row_is_data = _row_numeric_ratio(raw.iloc[i + 1]) >= 0.5
+        if this_row_is_text and next_row_is_data:
+            return i
+    return 0
+
+
+def load_from_upload(
+    filename: str, content: bytes | str, header_row: int = 0
+) -> DataSource:
+    """画面のドロップ領域からアップロードされたファイルをロードする。
+
+    - .csv / .xlsx / .xls に対応。判定はファイル名の拡張子で行う。
+    - header_row はヘッダ行の 0 始まりインデックス。呼び出し側（app.py）が
+      preview_upload()/guess_header_row() によるプレビューとユーザーの行選択で
+      決めた値を渡してくる。
+    - 失敗時は LoadError（日本語メッセージ）に正規化する。
+      アップロードは形式違反や空ファイルが普通に起こるので、
+      ここで拾って呼び出し側がそのまま画面に出せるようにする。
+    """
+    suffix = _check_upload_suffix(filename)
 
     try:
+        buf = _upload_buffer(suffix, content)
         if suffix in (".xlsx", ".xls"):
-            buf = io.BytesIO(content) if isinstance(content, bytes) else io.BytesIO(
-                content.encode("utf-8")
-            )
             df = pd.read_excel(buf, header=header_row)
         else:
-            buf = io.StringIO(content) if isinstance(content, str) else io.BytesIO(content)
             df = pd.read_csv(buf, header=header_row)
     except LoadError:
         raise

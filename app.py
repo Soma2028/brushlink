@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 
+import pandas as pd
 import panel as pn
 import param
 
@@ -53,17 +54,28 @@ fit_btn = pn.widgets.Button(name="選択範囲を回帰", button_type="primary")
 linker = charts.new_linker()
 
 # --- データアップロード -------------------------------------------------
+# ヘッダ行は数値で指定させるのではなく、先頭数行をそのまま表示して
+# 「この行をヘッダにする」をクリックで選ばせる。自動推定はあくまで
+# 初期選択（当てずっぽうで数字を打たせない）で、最終判断は必ずここで
+# 目視・クリックできるようにする。
 upload = pn.widgets.FileDropper(
     accepted_filetypes=[".csv", ".xlsx", ".xls"],
     multiple=False,
     layout="compact",
     max_file_size="200MB",
 )
-header_row_input = pn.widgets.IntInput(
-    name="ヘッダ行（0 始まり）", value=0, start=0, end=1000, step=1, width=180
+preview_table = pn.widgets.Tabulator(
+    pd.DataFrame(),
+    disabled=True,
+    selectable=1,
+    show_index=True,
+    height=190,
+    theme="simple",
 )
+preview_hint = pn.pane.Markdown("", margin=(0, 0, 5, 0))
 upload_status = pn.pane.Markdown("", margin=(5, 0))
 _last_upload: tuple[str, bytes | str] | None = None
+_syncing_preview_selection = False  # 推定行のセットを「ユーザーのクリック」と混同しないためのガード
 
 # --- フィルタパネル -------------------------------------------------
 filter_panel = filters.build(ds)
@@ -162,24 +174,59 @@ def _try_load(filename: str, content, header_row: int) -> None:
 
 
 def _on_upload(event) -> None:
-    global _last_upload
+    """ファイルが drop されたら、まず生の先頭行をプレビューに出す。
+
+    この時点ではまだ本読み込みしない（ヘッダ行が決まっていないため）。
+    推定したヘッダ行を初期選択にし、それをそのまま最初の読み込みにも使う
+    ——「推定に失敗してもプレビューから選び直せる」を成立させるため、
+    最終的な読み込みトリガーは常に「プレビュー表の選択」に一本化する。
+    """
+    global _last_upload, _syncing_preview_selection
+
     if not upload.value:
         return
     filename, content = next(iter(upload.value.items()))
     _last_upload = (filename, content)
-    _try_load(filename, content, header_row_input.value)
 
-
-def _on_header_row_change(event) -> None:
-    # ヘッダ行だけ変えて読み直したいケース（1 行目がヘッダでない実験データ）に対応。
-    if _last_upload is None:
+    try:
+        raw = data.preview_upload(filename, content)
+    except data.LoadError as e:
+        upload_status.object = f"⚠️ {e}"
+        preview_table.value = pd.DataFrame()
+        preview_hint.object = ""
         return
+
+    preview_table.value = raw
+    guess = data.guess_header_row(raw)
+    preview_hint.object = (
+        f"推定ヘッダ行: **{guess} 行目**"
+        "（文字列だけの行の次に数値中心の行が続く箇所を推定）。"
+        "違う場合は下の表で行をクリックして選び直してください。"
+    )
+    upload_status.object = ""
+
+    # プログラムでの selection 代入は「ユーザーのクリック」と区別する
+    # （_on_preview_select を二重発火させず、下の _try_load 呼び出し1回に絞るため）。
+    _syncing_preview_selection = True
+    try:
+        preview_table.selection = [guess]
+    finally:
+        _syncing_preview_selection = False
+
+    _try_load(filename, content, guess)
+
+
+def _on_preview_select(event) -> None:
+    """プレビュー表の行クリック＝「この行をヘッダにする」。選ぶたびに読み直す。"""
+    if _syncing_preview_selection or _last_upload is None or not preview_table.selection:
+        return
+    header_row = preview_table.selection[0]
     filename, content = _last_upload
-    _try_load(filename, content, header_row_input.value)
+    _try_load(filename, content, header_row)
 
 
 upload.param.watch(_on_upload, "value")
-header_row_input.param.watch(_on_header_row_change, "value")
+preview_table.param.watch(_on_preview_select, "selection")
 
 
 # ---------------------------------------------------------------
@@ -263,9 +310,11 @@ upload_section = pn.Column(
     pn.pane.Markdown(
         "### データ読み込み\n"
         "CSV / Excel(.xlsx) をドラッグ＆ドロップ。"
-        "1 行目がヘッダでない場合はヘッダ行を指定してください。"
+        "先頭数行のプレビューが出るので、ヘッダの行をクリックして選んでください。"
     ),
-    pn.Row(upload, header_row_input),
+    upload,
+    preview_hint,
+    preview_table,
     upload_status,
 )
 

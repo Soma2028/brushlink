@@ -124,6 +124,44 @@ def main() -> int:
     except data.LoadError as e:
         print(f"[5.7] 数値列不足エラー: {e}")
 
+    # --- ヘッダ行のプレビュー・自動推定 -------------------------------------
+    # 数字を打たせるのではなく、先頭行をそのまま見せて選ばせる方式の検証。
+    # 1) ヘッダが 1 行目にある素直なケース: guess == 0
+    plain_bytes = csv_bytes  # 身長,体重,グループ ... （すでに定義済み）
+    plain_raw = data.preview_upload("probe.csv", plain_bytes)
+    assert list(plain_raw.iloc[0]) == ["身長", "体重", "グループ"], "プレビューが加工されている"
+    plain_guess = data.guess_header_row(plain_raw)
+    print(f"[5.8] プレビュー(素直なCSV): 推定ヘッダ行={plain_guess}")
+    assert plain_guess == 0
+    assert data.load_from_upload("probe.csv", plain_bytes, header_row=plain_guess).num_cols == ["身長", "体重"]
+
+    # 2) タイトル行・単位行を挟んで 3 行目がヘッダになる、実験機器の出力に近いケース
+    #    （sample_baiyou.xlsx の構造を模した合成データで検証）
+    offset3_bytes = (
+        "測定結果（2026年度）,,\n"
+        "-,degC,%\n"
+        "サンプルID,温度,生存率\n"
+        "S0001,39.69,79.74\n"
+        "S0002,39.39,81.95\n"
+    ).encode("utf-8")
+    offset3_raw = data.preview_upload("offset3.csv", offset3_bytes)
+    offset3_guess = data.guess_header_row(offset3_raw)
+    print(f"[5.9] プレビュー(3行目がヘッダ): 推定ヘッダ行={offset3_guess}")
+    assert offset3_guess == 2, "タイトル・単位行を挟んだヘッダ推定に失敗しています"
+    offset3_ds = data.load_from_upload("offset3.csv", offset3_bytes, header_row=offset3_guess)
+    assert offset3_ds.num_cols == ["温度", "生存率"]
+    assert offset3_ds.n_rows == 2
+
+    # 3) 推定が外れても（例えば 1 行目を選んでしまっても）、プレビューから
+    #    正しい行を選び直せば読み込めること（「推定失敗でも手動で成立する」設計の確認）
+    try:
+        data.load_from_upload("offset3.csv", offset3_bytes, header_row=1)
+        assert False, "単位行をヘッダにしても読み込めてしまっている"
+    except data.LoadError:
+        pass  # 単位行は数値列にならないので数値列不足で弾かれるはず
+    retry_ds = data.load_from_upload("offset3.csv", offset3_bytes, header_row=2)
+    assert retry_ds.num_cols == ["温度", "生存率"], "手動での選び直しが機能していません"
+
     # --- 高カーディナリティ列の除外 -------------------------------------
     # ID 列のような「ほぼ全行ユニーク」な列はチェックボックス・色分けに
     # 向かないので、cat_cols/フィルタ/色分けの対象から外れることを検証する。
