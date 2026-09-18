@@ -23,7 +23,7 @@ Python / R で再実装した探索的データ分析ダッシュボード。就
 ```bash
 source .venv/bin/activate          # Mac では venv 必須（externally-managed-environment 対策）
 panel serve app.py --show          # 開発サーバ
-panel serve app.py --show --args data/your.csv   # 任意の CSV を読ませる場合
+panel serve app.py --show --args data/your.csv   # 開発用: 起動時に読ませるファイルを指定
 python tests/smoke_test.py         # ブラウザ不要の検証。変更後は必ず通す
 ```
 
@@ -35,6 +35,8 @@ python tests/smoke_test.py         # ブラウザ不要の検証。変更後は�
 ```
 app.py              ウィジェット定義とレイアウトの組み立てのみ。ロジックは置かない
 src/data.py         DuckDB への読み込み、列の型・カーディナリティ推定
+                     load_from_upload() が画面アップロード（.csv/.xlsx）の入口。
+                     失敗は LoadError（日本語メッセージ）に正規化する
 src/charts.py       チャート生成と選択連動（link_selections）
 src/filters.py      フィルタパネルのウィジェット生成と母集団の絞り込み
 src/r_bridge.py     R 連携。R 不在時は numpy にフォールバック
@@ -91,17 +93,16 @@ README の「フィルタと選択の関係」参照）。フィルタで母集�
 
 1. ~~**散布図の選択ツールを初期状態で有効にする**~~ — 完了
 2. ~~**サイドバーにフィルタパネルを追加**~~ — 完了（`src/filters.py`）
+3. ~~**画面から CSV をアップロードできるようにする**~~ — 完了
+   （`data.load_from_upload()`、画面上部の `FileDropper`。.csv / .xlsx / .xls、
+   ヘッダ行指定、失敗時は `LoadError` を日本語メッセージで画面表示）
+4. ~~**CSV アップロード時にフィルタパネルを動的に再構築する**~~ — 完了
+   （項目 3 の実装で同時に対応。`app.py` の `AppState.version` を再描画の
+   間接トリガーにして、列構成が変わってもウィジェット依存関係が壊れないようにした）
 
-3. **画面から CSV をアップロードできるようにする**
-   `--args` 依存をなくす。製品方針のとおり、ターミナル操作は開発用の補助に留める。
-
-4. **起動直後の初期表示を自動生成する**
+5. **起動直後の初期表示を自動生成する**
    相関の高い数値列 2 つを X/Y に自動選択する。初期状態は自動で組み立て、
    操作すれば細かく変更できるという製品方針に沿う。
-
-5. **CSV アップロード時にフィルタパネルを動的に再構築する**
-   `src/filters.py` のフィルタパネル自体は完了済みだが、現状はアプリ起動時に
-   一度だけ組み立てている。アップロードされた列構成に合わせて作り直す。
 
 6. **選択範囲の CSV 書き出し**
 

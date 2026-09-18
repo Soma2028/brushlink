@@ -1,9 +1,11 @@
 panel>=1.4
+param>=2.1      # panel の依存だが app.py で直接 import するため明示
 hvplot>=0.10
 holoviews>=1.19
 bokeh>=3.4
 duckdb>=1.0
 pandas>=2.2
 numpy>=1.26
+openpyxl>=3.1   # .xlsx アップロードの読み込み（pandas.read_excel のエンジン）
 # R 連携（任意）: R 本体を入れた上で pip install rpy2
 # rpy2>=3.5
