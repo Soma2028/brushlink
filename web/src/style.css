@@ -19,3 +19,37 @@ body {
   gap: 1rem;
   flex-wrap: wrap;
 }
+
+#dropzone {
+  border: 2px dashed #888;
+  border-radius: 4px;
+  padding: 1.5rem;
+  text-align: center;
+  cursor: pointer;
+  color: #555;
+}
+
+#dropzone.dragover {
+  border-color: #2f6f9f;
+  color: #2f6f9f;
+}
+
+#uploadStatus {
+  margin: 0.5rem 0;
+  white-space: pre-line;
+}
+
+#previewTable,
+#uploadResult table {
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  margin-top: 0.5rem;
+}
+
+#previewTable th,
+#previewTable td,
+#uploadResult th,
+#uploadResult td {
+  border: 1px solid #ccc;
+  padding: 2px 6px;
+}

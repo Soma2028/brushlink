@@ -32,6 +32,16 @@ import {
   width,
   height,
 } from '@uwdata/vgplot';
+import type { Coordinator } from '@uwdata/vgplot';
+import type * as duckdbWasm from '@duckdb/duckdb-wasm';
+import {
+  UploadError,
+  parseRaw,
+  previewRows,
+  guessHeaderRow,
+  rowsToCsv,
+  registerCsvTable,
+} from './upload';
 
 type MarkKind = 'dot' | 'raster' | 'hexbin';
 
@@ -102,13 +112,32 @@ function buildScatterMark(kind: MarkKind, filterBy: ReturnType<typeof Selection.
 }
 
 document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
-  <h1>Brushlink — Web 版 技術検証（データ量の限界計測）</h1>
-  <p>行数・マーク種別は URL パラメータで切り替える
-     （例: <code>?n=1000000&amp;mark=raster</code>）。既定は 300 行 / dot。
-     mark は dot / raster / hexbin。</p>
-  <div id="status"></div>
-  <p>選択中: <span id="count">-</span></p>
-  <div id="plots"></div>
+  <h1>Brushlink — Web 版</h1>
+
+  <section id="upload-section">
+    <h2>ファイル読み込み</h2>
+    <div id="dropzone" tabindex="0">
+      ここに CSV / Excel(.xlsx) をドラッグ＆ドロップ、またはクリックして選択
+    </div>
+    <input type="file" id="fileInput" accept=".csv,.xlsx,.xls" hidden />
+    <div id="uploadStatus"></div>
+    <p id="previewHint" hidden>
+      先頭数行のプレビュー。ヘッダにする行をクリックして選ぶ
+      （自動推定した行を初期選択にしてある）。
+    </p>
+    <table id="previewTable"></table>
+    <div id="uploadResult"></div>
+  </section>
+
+  <section id="demo-section">
+    <h2>技術検証（データ量の限界計測）</h2>
+    <p>行数・マーク種別は URL パラメータで切り替える
+       （例: <code>?n=1000000&amp;mark=raster</code>）。既定は 300 行 / dot。
+       mark は dot / raster / hexbin。</p>
+    <div id="status"></div>
+    <p>選択中: <span id="count">-</span></p>
+    <div id="plots"></div>
+  </section>
 `;
 
 const statusEl = document.querySelector<HTMLDivElement>('#status')!;
@@ -118,6 +147,154 @@ const plotsEl = document.querySelector<HTMLDivElement>('#plots')!;
 function log(line: string) {
   console.log(line);
   statusEl.textContent += (statusEl.textContent ? '\n' : '') + line;
+}
+
+const dropzoneEl = document.querySelector<HTMLDivElement>('#dropzone')!;
+const fileInputEl = document.querySelector<HTMLInputElement>('#fileInput')!;
+const uploadStatusEl = document.querySelector<HTMLDivElement>('#uploadStatus')!;
+const previewHintEl = document.querySelector<HTMLParagraphElement>('#previewHint')!;
+const previewTableEl = document.querySelector<HTMLTableElement>('#previewTable')!;
+const uploadResultEl = document.querySelector<HTMLDivElement>('#uploadResult')!;
+
+function setUploadStatus(message: string, isError: boolean) {
+  uploadStatusEl.textContent = message;
+  uploadStatusEl.style.color = isError ? 'crimson' : 'inherit';
+}
+
+// アップロードされたファイルの中身（セル値・列名）をそのまま innerHTML に
+// 差し込むため、HTML として解釈されないようにエスケープする。
+function escapeHtml(value: string): string {
+  const div = document.createElement('div');
+  div.textContent = value;
+  return div.innerHTML;
+}
+
+/**
+ * 先頭数行のプレビューを表として描画する。各行の先頭セルに
+ * 「この行をヘッダにする」ラジオボタンを置き、クリックで選び直せるようにする。
+ * 数値入力のヘッダ行指定は置かない。
+ */
+function renderPreview(
+  rows: unknown[][],
+  headerRow: number,
+  onSelect: (row: number) => void
+) {
+  const rowsToShow = previewRows(rows);
+  const maxCols = Math.max(...rowsToShow.map((r) => r.length), 1);
+
+  const thead = `
+    <thead><tr><th>ヘッダにする</th>${Array.from({ length: maxCols }, (_, i) => `<th>列${i}</th>`).join('')}</tr></thead>
+  `;
+  const tbody = rowsToShow
+    .map((row, i) => {
+      const cells = Array.from({ length: maxCols }, (_, c) => {
+        const v = row[c];
+        return `<td>${v === null || v === undefined ? '' : escapeHtml(String(v))}</td>`;
+      }).join('');
+      const checked = i === headerRow ? 'checked' : '';
+      return `<tr><td><input type="radio" name="headerRowChoice" value="${i}" ${checked}></td>${cells}</tr>`;
+    })
+    .join('');
+
+  previewTableEl.innerHTML = thead + `<tbody>${tbody}</tbody>`;
+  previewHintEl.hidden = false;
+
+  previewTableEl.querySelectorAll<HTMLInputElement>('input[name="headerRowChoice"]').forEach((input) => {
+    input.addEventListener('change', () => onSelect(Number(input.value)));
+  });
+}
+
+/**
+ * ドロップ領域・ファイル選択・ヘッダ行クリックの一連を配線する。
+ *
+ * 読み込みトリガーは常に「プレビュー表の行クリック」に一本化してある
+ * （Python版と同じ設計）。ファイルを受け取った直後は自動推定した行で
+ * 一度読み込みを試みるが、それも `loadWithHeaderRow` を呼ぶだけで、
+ * ユーザーが後から別の行をクリックした場合と同じ経路を通る。
+ */
+function setupUpload(db: Coordinator, duckdb: duckdbWasm.AsyncDuckDB) {
+  let currentRows: unknown[][] | null = null;
+  let currentFileName = '';
+
+  function showError(e: unknown) {
+    const message =
+      e instanceof UploadError
+        ? e.message
+        : `予期しないエラーが発生しました: ${e instanceof Error ? e.message : String(e)}`;
+    setUploadStatus(`⚠️ ${message}`, true);
+    uploadResultEl.innerHTML = '';
+  }
+
+  async function loadWithHeaderRow(headerRow: number) {
+    if (!currentRows) return;
+    setUploadStatus(`「${currentFileName}」を読み込み中…（ヘッダ行: ${headerRow}）`, false);
+    uploadResultEl.innerHTML = '';
+
+    try {
+      const csvText = rowsToCsv(currentRows, headerRow);
+      const table = await registerCsvTable(duckdb, db, 'uploaded', csvText);
+      setUploadStatus(
+        `✅「${currentFileName}」を読み込みました（${table.rowCount.toLocaleString()} 行、テーブル名: ${table.tableName}）`,
+        false
+      );
+      const columnRows = table.columns
+        .map((c) => `<tr><td>${escapeHtml(c.name)}</td><td>${escapeHtml(c.type)}</td></tr>`)
+        .join('');
+      uploadResultEl.innerHTML = `
+        <table><thead><tr><th>列名</th><th>DuckDBの型</th></tr></thead><tbody>${columnRows}</tbody></table>
+      `;
+    } catch (e) {
+      showError(e);
+    }
+  }
+
+  async function handleFile(file: File) {
+    setUploadStatus(`「${file.name}」を解析中…`, false);
+    uploadResultEl.innerHTML = '';
+    previewTableEl.innerHTML = '';
+    previewHintEl.hidden = true;
+    currentFileName = file.name;
+    currentRows = null;
+
+    try {
+      const rows = await parseRaw(file);
+      currentRows = rows;
+      const guess = guessHeaderRow(rows);
+      renderPreview(rows, guess, (row) => {
+        loadWithHeaderRow(row);
+      });
+      await loadWithHeaderRow(guess);
+    } catch (e) {
+      showError(e);
+    }
+  }
+
+  fileInputEl.addEventListener('change', () => {
+    const file = fileInputEl.files?.[0];
+    if (file) handleFile(file);
+  });
+
+  dropzoneEl.addEventListener('click', () => fileInputEl.click());
+  dropzoneEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      fileInputEl.click();
+    }
+  });
+
+  dropzoneEl.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    dropzoneEl.classList.add('dragover');
+  });
+  dropzoneEl.addEventListener('dragleave', () => {
+    dropzoneEl.classList.remove('dragover');
+  });
+  dropzoneEl.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropzoneEl.classList.remove('dragover');
+    const file = e.dataTransfer?.files?.[0];
+    if (file) handleFile(file);
+  });
 }
 
 // --- サンプル CSV をその場で生成する（外部ファイル取得を経路から外し、
@@ -178,6 +355,9 @@ async function main() {
   log(`[計測] CSV生成(JS側、参考値): ${genMs.toFixed(1)} ms`);
 
   const duckdb = await connector.getDuckDB();
+
+  setupUpload(db, duckdb);
+
   const tLoad0 = performance.now();
   await duckdb.registerFileText('points.csv', csvText);
   await db.exec(loadCSV('points', 'points.csv'));

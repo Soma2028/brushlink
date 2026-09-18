@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@duckdb/duckdb-wasm": "^1.33.1-dev57.0",
-    "@uwdata/vgplot": "^0.31.0"
+    "@uwdata/vgplot": "^0.31.0",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   }
 }
