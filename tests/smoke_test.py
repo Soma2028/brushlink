@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import holoviews as hv  # noqa: E402
 
-from src import charts, data, r_bridge  # noqa: E402
+from src import charts, data, filters, r_bridge  # noqa: E402
 
 hv.extension("bokeh")
 
@@ -42,6 +42,37 @@ def main() -> int:
     layout = charts.build(charts.new_linker(), ds.df, "温度", "収率", "ロット")
     print(f"[3] チャート構築: {len(layout)} 枚")
     assert len(layout) == 3
+
+    # フィルタパネル：初期値は「全件を通す」（フル範囲・全選択）であること
+    fp = filters.build(ds)
+    full = filters.apply(ds.df, fp)
+    print(f"[3.5] フィルタ初期状態: {len(full):,} / {ds.n_rows:,} 行")
+    assert len(full) == ds.n_rows, "初期状態で母集団が絞られてしまっています"
+
+    # 数値レンジスライダーを狭めると母集団が絞られること
+    num_col = ds.num_cols[0]
+    lo, hi = fp.num_widgets[num_col].start, fp.num_widgets[num_col].end
+    fp.num_widgets[num_col].value = (lo, lo + (hi - lo) / 2)
+    narrowed = filters.apply(ds.df, fp)
+    print(f"[3.6] レンジ絞り込み ({num_col}): {len(narrowed):,} 行")
+    assert 0 < len(narrowed) < ds.n_rows, "レンジフィルタが効いていません"
+    fp.num_widgets[num_col].value = (lo, hi)  # 元に戻す
+
+    # カテゴリのチェックを一部外すと母集団が絞られ、全部外すと 0 件になること
+    cat_col = ds.cat_cols[0]
+    all_opts = fp.cat_widgets[cat_col].options
+    fp.cat_widgets[cat_col].value = all_opts[:1]
+    cat_narrowed = filters.apply(ds.df, fp)
+    print(f"[3.7] カテゴリ絞り込み ({cat_col}={all_opts[:1]}): {len(cat_narrowed):,} 行")
+    assert 0 < len(cat_narrowed) < ds.n_rows, "カテゴリフィルタが効いていません"
+    fp.cat_widgets[cat_col].value = []
+    assert len(filters.apply(ds.df, fp)) == 0, "全チェックを外しても 0 件になっていません"
+
+    # フィルタ（母集団の絞り込み）とチャート選択（母集団内の絞り込み）は独立して重ねられること
+    fp.cat_widgets[cat_col].value = all_opts
+    fdf = filters.apply(ds.df, fp)
+    combined = charts.apply_selection(fdf, expr)
+    assert len(combined) <= len(sub), "フィルタと選択の重ね掛けがおかしい"
 
     # 選択範囲への回帰
     fit = r_bridge.linear_model(sub, "温度", "収率")
