@@ -1,0 +1,9 @@
+panel>=1.4
+hvplot>=0.10
+holoviews>=1.19
+bokeh>=3.4
+duckdb>=1.0
+pandas>=2.2
+numpy>=1.26
+# R 連携（任意）: R 本体を入れた上で pip install rpy2
+# rpy2>=3.5
