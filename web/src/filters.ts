@@ -84,6 +84,11 @@ export async function classifyColumns(
   return { numericCols, catCols, highCardCols };
 }
 
+// 数値レンジスライダーの分解能。値域を何段階で動かせるか。
+// 200 段なら値域の 0.5% 刻みで、サイドバー幅（約 280px）のスライダーでは
+// 1段がほぼ 1〜2px に相当し、これ以上細かくしてもマウスで狙えないため。
+const SLIDER_STEPS = 200;
+
 export interface NumericFilter {
   column: string;
   min: number;
@@ -101,6 +106,8 @@ export interface FilterPanel {
   element: HTMLElement;
   numeric: NumericFilter[];
   categorical: CategoryFilter[];
+  // すべてのフィルタを初期状態（全件を通す）に戻す
+  reset: () => void;
 }
 
 /**
@@ -204,6 +211,53 @@ export async function buildFilterPanel(
     onMissingIncludedChange(entries);
   }
 
+  // 各フィルタの「初期状態に戻す」処理。パネル全体のリセットボタンから呼ぶ
+  const resetters: (() => void)[] = [];
+
+  /**
+   * 「欠測を含める」チェックボックスを作る。欠測が実在しない列には出さない
+   * （無意味なトグルを見せないため）。
+   */
+  function addNullsToggle(wrap: HTMLElement, col: string, publish: () => void) {
+    if (!(nullCounts[col] > 0)) return;
+    includeNullsByCol.set(col, true);
+    const nullsLabel = document.createElement('label');
+    nullsLabel.className = 'filter-nulls-toggle';
+    const nullsCheckbox = document.createElement('input');
+    nullsCheckbox.type = 'checkbox';
+    nullsCheckbox.checked = true;
+    nullsCheckbox.addEventListener('change', () => {
+      includeNullsByCol.set(col, nullsCheckbox.checked);
+      publish();
+      notifyMissingIncluded();
+    });
+    nullsLabel.append(
+      nullsCheckbox,
+      document.createTextNode(`欠測 ${nullCounts[col].toLocaleString()} 件を含める`)
+    );
+    wrap.appendChild(nullsLabel);
+    resetters.push(() => {
+      nullsCheckbox.checked = true;
+      includeNullsByCol.set(col, true);
+    });
+  }
+
+  function filterHeader(col: string, kindLabel: string): { head: HTMLElement; value: HTMLElement } {
+    const head = document.createElement('div');
+    head.className = 'filter-head';
+    const label = document.createElement('span');
+    label.className = 'filter-name';
+    label.textContent = col;
+    label.title = col;
+    const kind = document.createElement('span');
+    kind.className = 'filter-kind';
+    kind.textContent = kindLabel;
+    const value = document.createElement('span');
+    value.className = 'filter-range-value';
+    head.append(label, kind, value);
+    return { head, value };
+  }
+
   for (const col of cols.numericCols) {
     const row: any = (
       await db.query(
@@ -216,52 +270,66 @@ export async function buildFilterPanel(
 
     const wrap = document.createElement('div');
     wrap.className = 'filter-item';
-    const label = document.createElement('label');
-    label.textContent = col;
+    const { head, value: valueLabel } = filterHeader(col, '数値');
+
+    // 下限・上限の2本のスライダーを1本の軌道に重ねる（デュアルスライダー）。
+    // 2本を縦に並べるより「どこからどこまで」が一目で分かるため。
+    // ブラウザ標準の range を2つ重ね、つまみ以外はクリックを透過させる
+    // （外部の UI ライブラリを足さずに済ませるため）。
+    const slider = document.createElement('div');
+    slider.className = 'dual-range';
+    const track = document.createElement('div');
+    track.className = 'dual-range-track';
+    const fill = document.createElement('div');
+    fill.className = 'dual-range-fill';
+    track.appendChild(fill);
     const lowInput = document.createElement('input');
     const highInput = document.createElement('input');
-    const valueLabel = document.createElement('span');
-    valueLabel.className = 'filter-range-value';
+    lowInput.setAttribute('aria-label', `${col} の下限`);
+    highInput.setAttribute('aria-label', `${col} の上限`);
 
-    const step = hi > lo ? (hi - lo) / 200 : 1;
+    // スライダー自体は 0〜SLIDER_STEPS の整数位置で持ち、値へは toValue で
+    // 写す。range に小数の min/max/step を直接渡すと、ブラウザが値を
+    // step の整数倍に丸める際の浮動小数点誤差で右端が1ステップ手前になり、
+    // つまみを動かしていないのに最大値の行が母集団から落ちるため。
+    // 端の位置は必ず真の最小値・最大値に写す。
+    const toValue = (pos: number): number =>
+      pos <= 0 ? lo : pos >= SLIDER_STEPS ? hi : lo + ((hi - lo) * pos) / SLIDER_STEPS;
     for (const input of [lowInput, highInput]) {
       input.type = 'range';
-      input.min = String(lo);
-      input.max = String(hi);
-      input.step = String(step || 1);
+      input.min = '0';
+      input.max = String(SLIDER_STEPS);
+      input.step = '1';
     }
-    lowInput.value = String(lo);
-    highInput.value = String(hi);
+    lowInput.value = '0';
+    highInput.value = String(SLIDER_STEPS);
+    slider.append(track, lowInput, highInput);
 
     const source = { kind: 'numeric-filter', column: col };
     const publish = () => {
-      let a = Number(lowInput.value);
-      let b = Number(highInput.value);
+      let a = toValue(Number(lowInput.value));
+      let b = toValue(Number(highInput.value));
       if (a > b) [a, b] = [b, a]; // 下限が上限を追い越したら入れ替えて扱う
       valueLabel.textContent = `${formatNumber(a)} 〜 ${formatNumber(b)}`;
+      const span = hi > lo ? hi - lo : 1;
+      fill.style.left = `${((a - lo) / span) * 100}%`;
+      fill.style.right = `${((hi - b) / span) * 100}%`;
+      // 範囲を狭めたか、欠測を外したときに「効いているフィルタ」として目立たせる
+      const narrowed = a > lo || b < hi || includeNullsByCol.get(col) === false;
+      wrap.classList.toggle('is-active', narrowed);
       filterSelection.update(numericRangeClause(col, a, b, source, includeNullsByCol.get(col) ?? true));
     };
     lowInput.addEventListener('input', publish);
     highInput.addEventListener('input', publish);
     valueLabel.textContent = `${formatNumber(lo)} 〜 ${formatNumber(hi)}`;
 
-    wrap.append(label, lowInput, highInput, valueLabel);
-
-    if (nullCounts[col] > 0) {
-      includeNullsByCol.set(col, true);
-      const nullsLabel = document.createElement('label');
-      nullsLabel.className = 'filter-nulls-toggle';
-      const nullsCheckbox = document.createElement('input');
-      nullsCheckbox.type = 'checkbox';
-      nullsCheckbox.checked = true;
-      nullsCheckbox.addEventListener('change', () => {
-        includeNullsByCol.set(col, nullsCheckbox.checked);
-        publish();
-        notifyMissingIncluded();
-      });
-      nullsLabel.append(nullsCheckbox, document.createTextNode('欠測を含める'));
-      wrap.appendChild(nullsLabel);
-    }
+    wrap.append(head, slider);
+    addNullsToggle(wrap, col, publish);
+    resetters.push(() => {
+      lowInput.value = '0';
+      highInput.value = String(SLIDER_STEPS);
+      publish();
+    });
 
     container.appendChild(wrap);
     numeric.push({ column: col, min: lo, max: hi, element: wrap });
@@ -276,14 +344,26 @@ export async function buildFilterPanel(
 
     const wrap = document.createElement('div');
     wrap.className = 'filter-item';
-    const label = document.createElement('label');
-    label.textContent = col;
-    wrap.appendChild(label);
+    const { head, value: valueLabel } = filterHeader(col, 'カテゴリ');
+
+    // 全選択/全解除の切り替え。20種近いカテゴリから1つだけ残したいときに、
+    // 19回クリックさせないため
+    const toggleAll = document.createElement('button');
+    toggleAll.type = 'button';
+    toggleAll.className = 'link-button';
+    head.appendChild(toggleAll);
+
+    const chips = document.createElement('div');
+    chips.className = 'filter-chips';
 
     const checkboxes: HTMLInputElement[] = [];
     const source = { kind: 'category-filter', column: col };
     const publish = () => {
       const selected = checkboxes.filter((cb) => cb.checked).map((cb) => cb.value);
+      valueLabel.textContent = `${selected.length}/${options.length}`;
+      toggleAll.textContent = selected.length === options.length ? '全解除' : '全選択';
+      const narrowed = selected.length < options.length || includeNullsByCol.get(col) === false;
+      wrap.classList.toggle('is-active', narrowed);
       filterSelection.update(categoryInClause(col, selected, source, includeNullsByCol.get(col) ?? true));
     };
     for (const opt of options) {
@@ -296,24 +376,22 @@ export async function buildFilterPanel(
       cb.addEventListener('change', publish);
       checkboxes.push(cb);
       optLabel.append(cb, document.createTextNode(opt));
-      wrap.appendChild(optLabel);
+      chips.appendChild(optLabel);
     }
+    toggleAll.addEventListener('click', () => {
+      const allOn = checkboxes.every((cb) => cb.checked);
+      for (const cb of checkboxes) cb.checked = !allOn;
+      publish();
+    });
+    valueLabel.textContent = `${options.length}/${options.length}`;
+    toggleAll.textContent = '全解除';
 
-    if (nullCounts[col] > 0) {
-      includeNullsByCol.set(col, true);
-      const nullsLabel = document.createElement('label');
-      nullsLabel.className = 'filter-nulls-toggle';
-      const nullsCheckbox = document.createElement('input');
-      nullsCheckbox.type = 'checkbox';
-      nullsCheckbox.checked = true;
-      nullsCheckbox.addEventListener('change', () => {
-        includeNullsByCol.set(col, nullsCheckbox.checked);
-        publish();
-        notifyMissingIncluded();
-      });
-      nullsLabel.append(nullsCheckbox, document.createTextNode('欠測を含める'));
-      wrap.appendChild(nullsLabel);
-    }
+    wrap.append(head, chips);
+    addNullsToggle(wrap, col, publish);
+    resetters.push(() => {
+      for (const cb of checkboxes) cb.checked = true;
+      publish();
+    });
 
     container.appendChild(wrap);
     categorical.push({ column: col, options, element: wrap });
@@ -335,7 +413,12 @@ export async function buildFilterPanel(
   }
   notifyMissingIncluded();
 
-  return { element: container, numeric, categorical };
+  function reset() {
+    for (const r of resetters) r();
+    notifyMissingIncluded();
+  }
+
+  return { element: container, numeric, categorical, reset };
 }
 
 function formatNumber(n: number): string {

@@ -15,6 +15,11 @@ import {
   intervalXY,
   width,
   height,
+  name,
+  colorLegend,
+  colorScheme,
+  xLabel,
+  yLabel,
 } from '@uwdata/vgplot';
 
 function quoteIdent(name: string): string {
@@ -73,47 +78,105 @@ export async function pickBestAxisPair(
   return pairs[Number(rows[0].idx)];
 }
 
+// 母集団のうち選択されていない部分を描く背景色。Spotfire のマーキングと
+// 同じく、選択外を消してしまわず薄く残すことで「全体の中のどこを選んだか」
+// を見失わないようにする。
+const BACKGROUND_FILL = '#d4d8de';
+// 色分けしないときの前景色（style.css の --accent と揃える）
+const ACCENT_FILL = '#2563eb';
+
 export interface ScatterConfig {
   tableName: string;
   x: string;
   y: string;
   colorCol: string | null;
   rowCount: number;
-  filterBy: Selection;
+  population: Selection; // フィルタ後の母集団（$filter）
+  brush: Selection; // チャート間のマーキング（$brush）
+  plotName: string; // 凡例を紐づけるための名前
+  width: number;
+  height: number;
 }
 
 /**
- * 散布図側のマークを組み立てる。行数が DOT_TO_RASTER_THRESHOLD 以上なら
+ * 散布図を組み立てる。行数が DOT_TO_RASTER_THRESHOLD 以上なら
  * raster、未満なら dot。ユーザーに選ばせる UI は作らない。
+ *
+ * dot のときは2層にする: 背景に母集団（$filter のみ）を灰色で、前景に
+ * マーキング後（$brush）を色付きで重ねる。こうすると他のチャートで
+ * 選択したとき、散布図上では「選ばれた点が色付きで浮き上がる」表示になる。
+ * raster は2層重ねると下の層が完全に隠れるうえ描画コストが倍になるため、
+ * 1層のままにする（大規模データでは応答速度を優先する）。
  */
 export function buildScatterPlot(cfg: ScatterConfig): HTMLElement {
-  const source = from(cfg.tableName, { filterBy: cfg.filterBy });
   const useRaster = cfg.rowCount >= DOT_TO_RASTER_THRESHOLD;
+  const fg = from(cfg.tableName, { filterBy: cfg.brush });
 
-  const mark = useRaster
-    ? raster(source, { x: cfg.x, y: cfg.y })
-    : dot(source, {
-        x: cfg.x,
-        y: cfg.y,
-        ...(cfg.colorCol ? { fill: cfg.colorCol } : {}),
-      });
+  const marks = useRaster
+    ? [raster(fg, { x: cfg.x, y: cfg.y, pixelSize: 2 })]
+    : [
+        dot(from(cfg.tableName, { filterBy: cfg.population }), {
+          x: cfg.x,
+          y: cfg.y,
+          fill: BACKGROUND_FILL,
+          r: 2.5,
+        }),
+        dot(fg, {
+          x: cfg.x,
+          y: cfg.y,
+          fill: cfg.colorCol ?? ACCENT_FILL,
+          r: 2.5,
+          fillOpacity: 0.8,
+        }),
+      ];
 
-  return plot(mark, intervalXY({ as: cfg.filterBy }), width(420), height(320));
+  return plot(
+    ...marks,
+    intervalXY({ as: cfg.brush }),
+    name(cfg.plotName),
+    xLabel(`${cfg.x} →`),
+    yLabel(`↑ ${cfg.y}`),
+    // カテゴリ色のスキームは dot の色分けにだけ使う。raster は密度を連続色で
+    // 塗るため、カテゴリ用スキームを渡すと補間関数が無く描画に失敗する
+    ...(useRaster ? [] : [colorScheme('tableau10')]),
+    width(cfg.width),
+    height(cfg.height)
+  );
 }
 
+/** 散布図の色分け列の凡例。凡例は plot の外に別要素として置く（vgplot の仕様）。 */
+export function buildColorLegend(plotName: string): HTMLElement {
+  return colorLegend({ for: plotName });
+}
+
+/**
+ * ヒストグラム。散布図と同じ理由で、母集団（灰色）とマーキング後（色付き）を
+ * 重ねる。ビン境界は両層とも列全体の範囲から決まるので、2層の棒は揃う。
+ */
 export function buildHistogram(
   tableName: string,
   column: string,
-  filterBy: Selection
+  population: Selection,
+  brush: Selection,
+  size: { width: number; height: number }
 ): HTMLElement {
   return plot(
-    rectY(from(tableName, { filterBy }), {
+    rectY(from(tableName, { filterBy: population }), {
       x: bin(column),
       y: count(),
-      fill: 'steelblue',
+      fill: BACKGROUND_FILL,
+      inset: 0.5,
     }),
-    intervalX({ as: filterBy }),
-    width(420),
-    height(200)
+    rectY(from(tableName, { filterBy: brush }), {
+      x: bin(column),
+      y: count(),
+      fill: ACCENT_FILL,
+      inset: 0.5,
+    }),
+    intervalX({ as: brush }),
+    xLabel(`${column} →`),
+    yLabel('件数'),
+    width(size.width),
+    height(size.height)
   );
 }
