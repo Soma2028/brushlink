@@ -106,43 +106,103 @@ export interface FilterPanel {
 /**
  * 数値レンジフィルタの節（clause）を作る。
  *
- * pandas 版で踏んだ不具合と同じ理由で、欠測（NULL）は無条件で通す。
- * SQL の `BETWEEN` は NULL に対して NULL（=偽扱い）を返すため、素直に
- * `isBetween` だけを使うと、フィルタを一切操作していなくても欠測を含む
- * 行だけ母集団から消えてしまう。`OR col IS NULL` を必ず添えることで、
- * 「初期状態は全件を通す」を欠測ありのデータでも成立させる。
+ * pandas 版で踏んだ不具合と同じ理由で、`includeNulls` が true の間は
+ * 欠測（NULL）を無条件で通す。SQL の `BETWEEN` は NULL に対して
+ * NULL（=偽扱い）を返すため、素直に `isBetween` だけを使うと、
+ * フィルタを一切操作していなくても欠測を含む行だけ母集団から消えてしまう。
+ * `OR col IS NULL` を添えることで、「初期状態は全件を通す」を欠測ありの
+ * データでも成立させる。`includeNulls` は「欠測を含める」チェックボックス
+ * （既定オン）で列ごとに切り替えられ、オフにすると素の `isBetween` になる。
  */
-function numericRangeClause(column: string, lo: number, hi: number, source: object): SelectionClause {
-  const predicate = or([isBetween(column, [lo, hi]), isNull(column)]);
+function numericRangeClause(
+  column: string,
+  lo: number,
+  hi: number,
+  source: object,
+  includeNulls: boolean
+): SelectionClause {
+  const base = isBetween(column, [lo, hi]);
+  const predicate = includeNulls ? or([base, isNull(column)]) : base;
   return { source, fields: [], value: [lo, hi], predicate };
 }
 
 /**
- * カテゴリチェックボックスの節を作る。数値レンジと同じ理由で、
- * 欠測は選択肢に関わらず無条件で通す。
+ * カテゴリチェックボックスの節を作る。数値レンジと同じ理由・同じ
+ * `includeNulls` の扱い方で、欠測を通すかどうかを列ごとに切り替えられる。
  */
-function categoryInClause(column: string, selected: string[], source: object): SelectionClause {
-  const predicate = or([isIn(column, selected.map((v) => literal(v))), isNull(column)]);
+function categoryInClause(
+  column: string,
+  selected: string[],
+  source: object,
+  includeNulls: boolean
+): SelectionClause {
+  const base = isIn(column, selected.map((v) => literal(v)));
+  const predicate = includeNulls ? or([base, isNull(column)]) : base;
   return { source, fields: [], value: selected, predicate };
+}
+
+// 「欠測を含める」チェックボックスがオンになっている列（かつ実際に欠測が
+// ある列）の一覧。件数表示の近くに出す注記の材料にするため main.ts に渡す。
+export interface MissingIncludedEntry {
+  column: string;
+  nullCount: number;
 }
 
 /**
  * フィルタパネルの DOM を組み立て、ウィジェット操作を $filter Selection への
  * 書き込みに配線する。数値列はレンジスライダー（下限・上限の2本）、
- * カテゴリ列はチェックボックス群。
+ * カテゴリ列はチェックボックス群。列ごとに欠測（NULL）があれば
+ * 「欠測を含める」チェックボックス（既定オン）を添える。
  *
- * 初期値は「全件を通す」状態（フル範囲・全選択）にする。フィルタパネルを
- * 開いた直後に母集団が意図せず絞られないようにするため（Python版と同じ方針）。
+ * 初期値は「全件を通す」状態（フル範囲・全選択・欠測を含める）にする。
+ * フィルタパネルを開いた直後に母集団が意図せず絞られないようにするため
+ * （Python版と同じ方針）。
+ *
+ * `onMissingIncludedChange` は「欠測を含める」チェックボックスの状態が
+ * 変わるたび（初回構築の直後も含む）に呼ばれ、現在含めている列の一覧を渡す。
+ * main.ts 側はこれを件数表示の近くの注記に反映するだけで、欠測の扱いの
+ * ロジック自体はこのモジュールに閉じている。
  */
 export async function buildFilterPanel(
   db: Coordinator,
   tableName: string,
   cols: ClassifiedColumns,
-  filterSelection: Selection
+  filterSelection: Selection,
+  onMissingIncludedChange: (entries: MissingIncludedEntry[]) => void
 ): Promise<FilterPanel> {
   const container = document.createElement('div');
   const numeric: NumericFilter[] = [];
   const categorical: CategoryFilter[] = [];
+
+  // フィルタ対象の列（数値・カテゴリ）の欠測件数を1クエリでまとめて取る
+  // （classifyColumns の distinct 件数取得と同じ理由で、列数分クエリを
+  // 投げるとテーブルスキャンが列数倍になるのを避ける）。
+  const filterableCols = [...cols.numericCols, ...cols.catCols];
+  const nullCounts: Record<string, number> = {};
+  if (filterableCols.length > 0) {
+    const selects = filterableCols
+      .map((c) => `count(*) - count(${quoteIdent(c)}) AS ${quoteIdent(c)}`)
+      .join(', ');
+    const result: any = await db.query(`SELECT ${selects} FROM ${quoteIdent(tableName)}`, {
+      cache: false,
+    });
+    const row = result.get(0);
+    for (const c of filterableCols) {
+      nullCounts[c] = Number(row[c]);
+    }
+  }
+
+  // 「欠測を含める」チェックボックスがある列（欠測が実在する列）の現在の状態。
+  // チェックボックスを出さない列（欠測なし）は常に true 扱いでよい
+  // （OR IS NULL を足しても該当行がないので害がない）。
+  const includeNullsByCol = new Map<string, boolean>();
+  function notifyMissingIncluded() {
+    const entries: MissingIncludedEntry[] = [];
+    for (const [column, included] of includeNullsByCol) {
+      if (included) entries.push({ column, nullCount: nullCounts[column] });
+    }
+    onMissingIncludedChange(entries);
+  }
 
   for (const col of cols.numericCols) {
     const row: any = (
@@ -179,13 +239,30 @@ export async function buildFilterPanel(
       let b = Number(highInput.value);
       if (a > b) [a, b] = [b, a]; // 下限が上限を追い越したら入れ替えて扱う
       valueLabel.textContent = `${formatNumber(a)} 〜 ${formatNumber(b)}`;
-      filterSelection.update(numericRangeClause(col, a, b, source));
+      filterSelection.update(numericRangeClause(col, a, b, source, includeNullsByCol.get(col) ?? true));
     };
     lowInput.addEventListener('input', publish);
     highInput.addEventListener('input', publish);
     valueLabel.textContent = `${formatNumber(lo)} 〜 ${formatNumber(hi)}`;
 
     wrap.append(label, lowInput, highInput, valueLabel);
+
+    if (nullCounts[col] > 0) {
+      includeNullsByCol.set(col, true);
+      const nullsLabel = document.createElement('label');
+      nullsLabel.className = 'filter-nulls-toggle';
+      const nullsCheckbox = document.createElement('input');
+      nullsCheckbox.type = 'checkbox';
+      nullsCheckbox.checked = true;
+      nullsCheckbox.addEventListener('change', () => {
+        includeNullsByCol.set(col, nullsCheckbox.checked);
+        publish();
+        notifyMissingIncluded();
+      });
+      nullsLabel.append(nullsCheckbox, document.createTextNode('欠測を含める'));
+      wrap.appendChild(nullsLabel);
+    }
+
     container.appendChild(wrap);
     numeric.push({ column: col, min: lo, max: hi, element: wrap });
   }
@@ -207,7 +284,7 @@ export async function buildFilterPanel(
     const source = { kind: 'category-filter', column: col };
     const publish = () => {
       const selected = checkboxes.filter((cb) => cb.checked).map((cb) => cb.value);
-      filterSelection.update(categoryInClause(col, selected, source));
+      filterSelection.update(categoryInClause(col, selected, source, includeNullsByCol.get(col) ?? true));
     };
     for (const opt of options) {
       const optLabel = document.createElement('label');
@@ -222,20 +299,41 @@ export async function buildFilterPanel(
       wrap.appendChild(optLabel);
     }
 
+    if (nullCounts[col] > 0) {
+      includeNullsByCol.set(col, true);
+      const nullsLabel = document.createElement('label');
+      nullsLabel.className = 'filter-nulls-toggle';
+      const nullsCheckbox = document.createElement('input');
+      nullsCheckbox.type = 'checkbox';
+      nullsCheckbox.checked = true;
+      nullsCheckbox.addEventListener('change', () => {
+        includeNullsByCol.set(col, nullsCheckbox.checked);
+        publish();
+        notifyMissingIncluded();
+      });
+      nullsLabel.append(nullsCheckbox, document.createTextNode('欠測を含める'));
+      wrap.appendChild(nullsLabel);
+    }
+
     container.appendChild(wrap);
     categorical.push({ column: col, options, element: wrap });
   }
 
-  // 初期状態（全件を通す）を明示的に発行する。
+  // 初期状態（全件を通す。欠測も含める）を明示的に発行する。
   // フィルタと選択は別系統だが、初期状態でも $filter に何らかの節が
   // 積まれている状態にしておくことで、後段の母集団カウント等が
   // 「フィルタなし」を特別扱いせずに済む。
   for (const n of numeric) {
-    filterSelection.update(numericRangeClause(n.column, n.min, n.max, { kind: 'numeric-filter', column: n.column }));
+    filterSelection.update(
+      numericRangeClause(n.column, n.min, n.max, { kind: 'numeric-filter', column: n.column }, true)
+    );
   }
   for (const c of categorical) {
-    filterSelection.update(categoryInClause(c.column, c.options, { kind: 'category-filter', column: c.column }));
+    filterSelection.update(
+      categoryInClause(c.column, c.options, { kind: 'category-filter', column: c.column }, true)
+    );
   }
+  notifyMissingIncluded();
 
   return { element: container, numeric, categorical };
 }

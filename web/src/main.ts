@@ -19,6 +19,7 @@ import {
 } from './upload';
 import type { LoadedTable } from './upload';
 import { classifyColumns, buildFilterPanel, newFilterSelection } from './filters';
+import type { MissingIncludedEntry } from './filters';
 import { pickBestAxisPair, buildScatterPlot, buildHistogram, DOT_TO_RASTER_THRESHOLD } from './charts';
 
 document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
@@ -51,6 +52,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       母集団: <span id="populationCount">-</span> /
       全体: <span id="totalCount">-</span> 件
     </p>
+    <div id="filterMissingNote"></div>
     <div id="filterExclusionNote"></div>
     <div id="filterPanel"></div>
     <div id="plots"></div>
@@ -72,6 +74,7 @@ const countLineEl = document.querySelector<HTMLParagraphElement>('#countLine')!;
 const selectedCountEl = document.querySelector<HTMLSpanElement>('#selectedCount')!;
 const populationCountEl = document.querySelector<HTMLSpanElement>('#populationCount')!;
 const totalCountEl = document.querySelector<HTMLSpanElement>('#totalCount')!;
+const filterMissingNoteEl = document.querySelector<HTMLDivElement>('#filterMissingNote')!;
 const filterExclusionNoteEl = document.querySelector<HTMLDivElement>('#filterExclusionNote')!;
 const filterPanelEl = document.querySelector<HTMLDivElement>('#filterPanel')!;
 const plotsEl = document.querySelector<HTMLDivElement>('#plots')!;
@@ -129,6 +132,23 @@ function renderPreview(
   });
 }
 
+/**
+ * 「欠測を含める」チェックボックスが現在オンになっている列の一覧を、
+ * 件数表示のすぐ下に注記として出す。列ごとに欠測件数も添えて、
+ * どれだけの行がレンジ・チェックボックスの条件をすり抜けて通っているかが
+ * 見えるようにする。
+ */
+function renderMissingIncludedNote(entries: MissingIncludedEntry[]) {
+  if (entries.length === 0) {
+    filterMissingNoteEl.textContent = '';
+    return;
+  }
+  const detail = entries
+    .map((e) => `${e.column}（${e.nullCount.toLocaleString()}件）`)
+    .join('、');
+  filterMissingNoteEl.textContent = `ℹ️ 欠測を含めているフィルタ: ${detail}`;
+}
+
 function populateAxisSelect(select: HTMLSelectElement, cols: string[], selected: string) {
   select.innerHTML = cols
     .map((c) => `<option value="${escapeHtml(c)}" ${c === selected ? 'selected' : ''}>${escapeHtml(c)}</option>`)
@@ -173,6 +193,7 @@ async function setupChartsAndFilters(db: Coordinator, table: LoadedTable) {
   setChartStatus('列を調べています…', false);
   countLineEl.hidden = true;
   axisControlsEl.hidden = true;
+  filterMissingNoteEl.textContent = '';
   filterExclusionNoteEl.textContent = '';
   filterPanelEl.innerHTML = '';
   plotsEl.innerHTML = '';
@@ -201,7 +222,7 @@ async function setupChartsAndFilters(db: Coordinator, table: LoadedTable) {
   const $brush = Selection.crossfilter({ include: [$filter] });
 
   try {
-    const panel = await buildFilterPanel(db, table.tableName, cols, $filter);
+    const panel = await buildFilterPanel(db, table.tableName, cols, $filter, renderMissingIncludedNote);
     filterPanelEl.appendChild(panel.element);
   } catch (e) {
     setChartStatus(

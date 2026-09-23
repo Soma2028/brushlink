@@ -20,6 +20,12 @@ body {
   font-weight: bold;
 }
 
+#filterMissingNote {
+  color: #2f6f9f;
+  font-size: 0.9rem;
+  margin: 0.5rem 0;
+}
+
 #filterExclusionNote {
   color: #a06400;
   font-size: 0.9rem;
@@ -56,6 +62,15 @@ body {
   align-items: center;
   gap: 0.2rem;
   margin-right: 0.5rem;
+}
+
+.filter-nulls-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  margin-left: 0.5rem;
+  color: #2f6f9f;
+  font-style: italic;
 }
 
 #dropzone {
