@@ -22,21 +22,21 @@ import {
   xLabel,
   yLabel,
   regressionY,
+  colorDomain,
 } from '@uwdata/vgplot';
 
 
 // dot と raster の自動切替閾値。ユーザーには選ばせず、行数から自動判定する
 // （CLAUDE.md「決まっていること」）。
 //
-// 根拠: docs/performance.md の計測。dot は10万行でドラッグ応答518ms、
-// 100万行で6,822ms と行数に対して非線形に悪化する一方、raster は
-// 1万〜100万行を通じて157〜158msでほぼ一定。10万行の時点で体感できる
-// 遅延（500ms超）が生じ始めるため、そこから十分小さい側に倒して
-// 50,000 を閾値にした。1万〜10万の間そのものは計測しておらず、
-// 50,000 という数値自体は計測で直接確認した境界ではなく、既知の安全域
-// （1万）と既知の危険域（10万）の間の暫定値である
-// （docs/performance.md「まだ分かっていないこと」参照）。
-export const DOT_TO_RASTER_THRESHOLD = 50_000;
+// 根拠: docs/performance.md「1万〜10万行の再計測」。ヒストグラムをドラッグして
+// いる間に最も長く止まった1フレーム（long task）は、dot では行数にほぼ比例して
+// 伸び、1万行 51ms → 1.5万行 76ms → 2万行 93〜109ms → 5万行 278ms。
+// raster は 1万〜10万行を通じて long task が出なかった。入力への応答が
+// 100ms を超えると遅れとして体感されるので、100ms を明確に下回った最大の
+// 計測点 15,000 を閾値にした（以前の 50,000 は、1万〜10万を計測しないまま
+// 置いた暫定値で、計測すると 5万行では毎フレーム約 280ms 止まっていた）。
+export const DOT_TO_RASTER_THRESHOLD = 15_000;
 
 export interface AxisPair {
   x: string;
@@ -98,6 +98,9 @@ export interface ScatterConfig {
   x: string;
   y: string;
   colorCol: string | null;
+  // 色分け列の全カテゴリ（絞り込み前）。固定しないと、絞り込みでカテゴリが
+  // 消えるたびに Plot が残りのカテゴリで色を振り直し、同じカテゴリの色が変わる
+  colorValues: unknown[] | null;
   rowCount: number;
   population: Selection; // フィルタ後の母集団（$filter）
   brush: Selection; // チャート間のマーキング（$brush、crossfilter）
@@ -177,6 +180,7 @@ export function buildScatterPlot(cfg: ScatterConfig): HTMLElement {
     // カテゴリ色のスキームは dot の色分けにだけ使う。raster は密度を連続色で
     // 塗るため、カテゴリ用スキームを渡すと補間関数が無く描画に失敗する
     ...(useRaster ? [] : [colorScheme('tableau10')]),
+    ...(!useRaster && cfg.colorCol && cfg.colorValues ? [colorDomain(cfg.colorValues)] : []),
     width(cfg.width),
     height(cfg.height)
   );

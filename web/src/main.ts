@@ -38,7 +38,13 @@ import {
 } from './charts';
 import { connectStatsClients, connectLiveCount, renderStatsTable, compareNumeric, formatStat } from './stats';
 import type { StatsSnapshot } from './stats';
-import { connectCategoryClients, renderCategoryComparison, compareCategories } from './categories';
+import {
+  connectCategoryClients,
+  renderCategoryComparison,
+  compareCategories,
+  fetchCategoryValues,
+  categoryLabels,
+} from './categories';
 import type { CategoryCounts } from './categories';
 import { connectRegressionClients, renderRegression } from './regression';
 import type { RegressionResult } from './regression';
@@ -406,21 +412,63 @@ function percent(part: number, whole: number): string {
   return `${p >= 10 || p === 0 ? p.toFixed(0) : p.toFixed(1)}%`;
 }
 
-/**
- * プロットの横幅を、置き場所の幅から決める。固定幅だと狭い画面で
- * 横スクロールが出て、広い画面では余白ばかりになるため。
- * 幅が変わったらチャートを作り直す必要があるが、リサイズ追従までは
- * しない（作り直すと選択が消えるため、ファイル読み込み・軸変更時に
- * 合わせて決める程度で十分と判断）。
- */
-function plotSizes(): { scatter: number; hist: number } {
-  const available = Math.max(plotsEl.clientWidth, 320);
-  if (available >= 900) {
-    const scatter = Math.floor(available * 0.58);
-    return { scatter, hist: available - scatter - 24 };
-  }
-  return { scatter: available, hist: available };
+interface PlotSizes {
+  scatter: { width: number; height: number };
+  hist: { width: number; height: number };
 }
+
+/**
+ * プロットの大きさを、置き場所の幅から決める。固定幅だと狭い画面で
+ * 横スクロールが出て、広い画面では余白ばかりになるため。
+ * 幅 900px 以上では散布図とヒストグラムを横に並べ、それ未満では縦に積む。
+ */
+function plotSizes(): PlotSizes {
+  const available = Math.max(plotsEl.clientWidth, 320);
+  const scatterWidth = available >= 900 ? Math.floor(available * 0.58) : available;
+  const histWidth = available >= 900 ? available - scatterWidth - 24 : available;
+  return {
+    scatter: { width: scatterWidth, height: Math.round(Math.min(scatterWidth * 0.75, 460)) },
+    hist: { width: histWidth, height: 190 },
+  };
+}
+
+// 描画中のプロット（vgplot の要素。value に Plot オブジェクトを持つ）
+type PlotElement = HTMLElement & { value?: { setAttribute(name: string, value: unknown): boolean; render(): Promise<void> } };
+let currentPlots: { scatter: PlotElement; hists: PlotElement[] } | null = null;
+let lastLayoutWidth = 0;
+
+/**
+ * ウィンドウの大きさが変わったら、チャートを作り直さずに大きさだけ変えて
+ * 描き直す。作り直すと選択（ブラシ）が消えてしまうが、Plot の幅を変えて
+ * render() するだけなら、手元のデータで描き直され、ブラシも範囲（データ値）
+ * から新しい目盛りの上に描き直される。クエリも投げ直さない。
+ * raster は画面の画素に合わせた集計なので、次に集計し直すまで画像が
+ * 引き伸ばされるが、ドラッグなどで次の更新が来れば正しい解像度に戻る。
+ */
+function resizePlots() {
+  if (!currentPlots) return;
+  const width = plotsEl.clientWidth;
+  // スクロールバーの出入り程度の小さな変化では描き直さない
+  if (Math.abs(width - lastLayoutWidth) < 16) return;
+  lastLayoutWidth = width;
+  const sizes = plotSizes();
+  const apply = (el: PlotElement, size: { width: number; height: number }) => {
+    const plot = el.value;
+    if (!plot) return;
+    const changedW = plot.setAttribute('width', size.width);
+    const changedH = plot.setAttribute('height', size.height);
+    if (changedW || changedH) plot.render();
+  };
+  apply(currentPlots.scatter, sizes.scatter);
+  currentPlots.hists.forEach((h) => apply(h, sizes.hist));
+}
+
+let resizeTimer: number | undefined;
+new ResizeObserver(() => {
+  // リサイズ中は連続して呼ばれるので、手が止まってから1回だけ描き直す
+  window.clearTimeout(resizeTimer);
+  resizeTimer = window.setTimeout(resizePlots, 200);
+}).observe(plotsEl);
 
 // ---------------------------------------------------------------------------
 // ブラシ（チャート上の範囲選択）の状態
@@ -506,6 +554,7 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
   categoryPanelEl.innerHTML = '';
   rowsPanelEl.innerHTML = '';
   mlPanel = null;
+  currentPlots = null;
 
   db.clear(); // 古いチャート・集計クライアントを切断する（既定で clients・cache とも true）
 
@@ -537,6 +586,17 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
   const colorCols = [...cols.catCols];
   const rowColumns = table.columns.map((c) => c.name);
   let filterDescriptions: string[] = [];
+  // 色分けに使いうる列の全カテゴリ（絞り込み前）。色の割り当てを固定するため
+  // （charts.ts の colorValues 参照）。機械学習で列を書き戻したら捨てて取り直す
+  const categoryValues = new Map<string, unknown[]>();
+  async function valuesFor(column: string): Promise<unknown[]> {
+    if (!categoryValues.has(column)) {
+      categoryValues.set(column, await fetchCategoryValues(db, table.tableName, column));
+    }
+    return categoryValues.get(column)!;
+  }
+  const categoryOrders = () =>
+    new Map([...categoryValues].map(([col, values]) => [col, categoryLabels(values)] as [string, string[]]));
 
   // ---- 集計結果の置き場と描画 ----
   const state: {
@@ -632,7 +692,7 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
 
     // カテゴリ構成
     if (state.selCats && state.popCats) {
-      renderCategoryComparison(categoryPanelEl, cols.catCols, state.selCats, state.popCats, hasSelection);
+      renderCategoryComparison(categoryPanelEl, cols.catCols, state.selCats, state.popCats, hasSelection, categoryOrders());
     } else if (cols.catCols.length === 0) {
       categoryPanelEl.innerHTML = '<p class="muted">カテゴリ列がありません（数値以外の列で、種類が20以下のもの）。</p>';
     }
@@ -670,6 +730,13 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
       });
     }
     connectRowsClient(db, table.tableName, rowColumns, $selectedSettled, rowsPanelEl);
+  }
+
+  try {
+    await Promise.all(cols.catCols.map(valuesFor));
+  } catch (e) {
+    setChartStatus(`⚠️ カテゴリの取得に失敗しました: ${e instanceof Error ? e.message : String(e)}`, true);
+    return;
   }
 
   // ---- 絞り込みパネル ----
@@ -727,12 +794,13 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
       axisCols.push(...added.numeric.filter((c) => !axisCols.includes(c)));
       colorCols.push(...added.categorical.filter((c) => !colorCols.includes(c)));
       rowColumns.push(...[...added.numeric, ...added.categorical].filter((c) => !rowColumns.includes(c)));
+      for (const c of added.categorical) categoryValues.delete(c);
       const [x, y] = added.axes ?? [xAxisSelectEl.value, yAxisSelectEl.value];
       populateAxisSelects(x, y, added.color ?? colorSelectEl.value);
       // 列の値を書き換えたので、Mosaic の事前集計（crossfilter 高速化用の
       // 集計済みテーブル）を捨てる。残すと古い値の集計が使われてしまう
       await db.preaggregator.dropSchema();
-      rebuildCharts();
+      await rebuildCharts();
     },
   });
   selectTab(activeTab);
@@ -778,7 +846,10 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
   populateAxisSelects(pair.x, pair.y, cols.catCols[0] ?? '');
   viewSectionEl.hidden = false;
 
-  function rebuildCharts() {
+  async function rebuildCharts() {
+    const colorCol = colorSelectEl.value || null;
+    const colorValues = colorCol && !useRaster ? await valuesFor(colorCol) : null;
+
     db.clear(); // 直前のチャート・集計クライアントを切断する
     // 軸が変わると古いブラシの範囲は新しいチャート上に描けないので、選択も解除する。
     // 残すと「見えない選択」が統計量に効き続けてしまう
@@ -788,7 +859,6 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
 
     const xCol = xAxisSelectEl.value;
     const yCol = yAxisSelectEl.value;
-    const colorCol = colorSelectEl.value || null;
     const sizes = plotSizes();
     // 凡例は名前で散布図を引くため、作り直すたびに別名にして古い図を掴まないようにする
     const plotName = `scatter-${++plotSerial}`;
@@ -798,18 +868,20 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
       x: xCol,
       y: yCol,
       colorCol,
+      colorValues,
       rowCount: table.rowCount,
       population: $filter,
       brush: $brush,
       selected: $selectedSettled,
       showRegression: regressionToggleEl.checked,
       plotName,
-      width: sizes.scatter,
-      height: Math.round(Math.min(sizes.scatter * 0.75, 460)),
+      width: sizes.scatter.width,
+      height: sizes.scatter.height,
     });
-    const histSize = { width: sizes.hist, height: 190 };
-    const histX = buildHistogram(table.tableName, xCol, $filter, $brush, histSize);
-    const histY = buildHistogram(table.tableName, yCol, $filter, $brush, histSize);
+    const histX = buildHistogram(table.tableName, xCol, $filter, $brush, sizes.hist);
+    const histY = buildHistogram(table.tableName, yCol, $filter, $brush, sizes.hist);
+    currentPlots = { scatter, hists: [histX, histY] };
+    lastLayoutWidth = plotsEl.clientWidth;
 
     const scatterWrap = document.createElement('div');
     scatterWrap.className = 'plot-main';
@@ -870,7 +942,7 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
   exportPngEl.onclick = () => exportFigure('png');
   exportSvgEl.onclick = () => exportFigure('svg');
 
-  rebuildCharts();
+  await rebuildCharts();
 }
 
 /**

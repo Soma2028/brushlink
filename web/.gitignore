@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Playwright の実行結果
+test-results
+playwright-report
+e2e/.fixtures

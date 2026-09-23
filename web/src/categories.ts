@@ -11,6 +11,7 @@ import type { Coordinator } from '@uwdata/vgplot';
 import { chiSquareTest, formatP } from './inference';
 import type { ChiSquareResult } from './inference';
 import { escapeHtml, helpTip } from './dom';
+import { quoteIdent } from './sql';
 
 // 欠測（NULL）のカテゴリを表す表示名。構成比から欠測を黙って落とさないため、
 // ひとつのカテゴリとして扱う
@@ -84,6 +85,25 @@ export function connectCategoryClients(
   });
 }
 
+/**
+ * 列の全カテゴリ（絞り込み前）を、Plot の既定と同じ昇順で取る。欠測は末尾。
+ * 散布図の色の割り当てと、カテゴリ構成タブの色を、絞り込みに左右されず
+ * 固定するために使う。値は型変換せずに返す（Plot に渡す値と型を揃えるため）。
+ */
+export async function fetchCategoryValues(db: Coordinator, tableName: string, column: string): Promise<unknown[]> {
+  const col = quoteIdent(column);
+  const result: any = await db.query(
+    `SELECT DISTINCT ${col} AS v FROM ${quoteIdent(tableName)} ORDER BY v NULLS LAST`,
+    { cache: false }
+  );
+  return result.toArray().map((r: any) => r.v);
+}
+
+/** fetchCategoryValues の値を、カテゴリ構成タブの表示名の並びにする。 */
+export function categoryLabels(values: unknown[]): string[] {
+  return values.map((v) => (v === null || v === undefined ? MISSING_LABEL : String(v)));
+}
+
 export interface CategoryComparison {
   column: string;
   categories: string[]; // 表示順（値の昇順、欠測は末尾）
@@ -136,19 +156,25 @@ export function compareCategories(
   });
 }
 
-function colorFor(categories: string[], index: number): string {
-  if (categories[index] === MISSING_LABEL) return MISSING_COLOR;
-  return PALETTE[index % PALETTE.length];
+/**
+ * カテゴリの色。並び順（＝色の割り当て）は絞り込み前の全カテゴリ（fullOrder）で
+ * 決める。表示中のカテゴリだけで数えると、絞り込みでカテゴリが減ったときに
+ * 残りの色がずれ、散布図の色分けとも食い違うため。
+ */
+function colorFor(category: string, fullOrder: string[]): string {
+  if (category === MISSING_LABEL) return MISSING_COLOR;
+  const i = fullOrder.indexOf(category);
+  return PALETTE[(i < 0 ? 0 : i) % PALETTE.length];
 }
 
-function stackedBar(label: string, counts: number[], categories: string[]): string {
+function stackedBar(label: string, counts: number[], categories: string[], fullOrder: string[]): string {
   const total = counts.reduce((s, v) => s + v, 0);
   const segments = counts
     .map((n, i) => {
       if (n === 0 || total === 0) return '';
       const share = (n / total) * 100;
       const text = share >= 9 ? `${share.toFixed(0)}%` : '';
-      return `<div class="stack-seg" style="width:${share}%;background:${colorFor(categories, i)}" title="${escapeHtml(categories[i])}: ${n.toLocaleString()} 件（${share.toFixed(1)}%）">${text}</div>`;
+      return `<div class="stack-seg" style="width:${share}%;background:${colorFor(categories[i], fullOrder)}" title="${escapeHtml(categories[i])}: ${n.toLocaleString()} 件（${share.toFixed(1)}%）">${text}</div>`;
     })
     .join('');
   return `<div class="stack-row"><span class="stack-label">${label}<small>${total.toLocaleString()} 件</small></span><div class="stack">${segments || '<div class="stack-empty">0 件</div>'}</div></div>`;
@@ -164,7 +190,8 @@ export function renderCategoryComparison(
   cols: string[],
   selected: CategoryCounts,
   population: CategoryCounts,
-  hasSelection: boolean
+  hasSelection: boolean,
+  fullOrders: Map<string, string[]>
 ) {
   if (cols.length === 0) {
     container.innerHTML = '<p class="muted">カテゴリ列がありません（数値以外の列で、種類が20以下のもの）。</p>';
@@ -173,16 +200,17 @@ export function renderCategoryComparison(
   const comparisons = compareCategories(cols, selected, population);
   container.innerHTML = comparisons
     .map((cmp) => {
+      const full = fullOrders.get(cmp.column) ?? cmp.categories;
       const legend = cmp.categories
         .map(
-          (k, i) =>
-            `<span class="legend-item"><span class="swatch" style="background:${colorFor(cmp.categories, i)}"></span>${escapeHtml(k)}</span>`
+          (k) =>
+            `<span class="legend-item"><span class="swatch" style="background:${colorFor(k, full)}"></span>${escapeHtml(k)}</span>`
         )
         .join('');
       const popCounts = cmp.selected.map((s, i) => s + cmp.rest[i]);
       const bars = hasSelection
-        ? stackedBar('選択中', cmp.selected, cmp.categories) + stackedBar('選択外', cmp.rest, cmp.categories)
-        : stackedBar('母集団', popCounts, cmp.categories);
+        ? stackedBar('選択中', cmp.selected, cmp.categories, full) + stackedBar('選択外', cmp.rest, cmp.categories, full)
+        : stackedBar('母集団', popCounts, cmp.categories, full);
       const testText =
         hasSelection && cmp.test
           ? `<span class="${cmp.test.p < 0.05 ? 'sig' : 'muted'}">χ² 検定 p ${cmp.test.p < 0.001 ? '' : '= '}${formatP(cmp.test.p)}・関連の強さ V = ${cmp.test.cramersV.toFixed(2)}</span>`
