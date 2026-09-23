@@ -2,6 +2,7 @@
 // Python版 src/charts.py 相当。
 
 import type { Coordinator } from '@uwdata/vgplot';
+import { quoteIdent } from './sql';
 import {
   Selection,
   plot,
@@ -20,11 +21,9 @@ import {
   colorScheme,
   xLabel,
   yLabel,
+  regressionY,
 } from '@uwdata/vgplot';
 
-function quoteIdent(name: string): string {
-  return `"${name.replace(/"/g, '""')}"`;
-}
 
 // dot と raster の自動切替閾値。ユーザーには選ばせず、行数から自動判定する
 // （CLAUDE.md「決まっていること」）。
@@ -39,22 +38,24 @@ function quoteIdent(name: string): string {
 // （docs/performance.md「まだ分かっていないこと」参照）。
 export const DOT_TO_RASTER_THRESHOLD = 50_000;
 
+export interface AxisPair {
+  x: string;
+  y: string;
+  r: number | null; // 選んだ2列の相関係数（画面で「なぜこの2列か」を説明するため）
+}
+
 /**
  * 数値列の中から、相関係数の絶対値が最も高い2列を選ぶ。
  * X/Y軸の初期値をユーザーに考えさせず自動生成するため（製品方針）。
- * 数値列がちょうど2つならそのまま返す。3つ以上ある場合は全ペアの
- * corr() を1クエリ（UNION ALL）にまとめて計算する。
+ * 全ペアの corr() を1クエリ（UNION ALL）にまとめて計算する。
  */
 export async function pickBestAxisPair(
   db: Coordinator,
   tableName: string,
   numericCols: string[]
-): Promise<[string, string]> {
+): Promise<AxisPair> {
   if (numericCols.length < 2) {
     throw new Error('数値列が2つ以上ないため軸を選べません。');
-  }
-  if (numericCols.length === 2) {
-    return [numericCols[0], numericCols[1]];
   }
 
   const pairs: [string, string][] = [];
@@ -67,15 +68,18 @@ export async function pickBestAxisPair(
   const selects = pairs
     .map(
       ([a, b], idx) =>
-        `SELECT ${idx} AS idx, abs(corr(${quoteIdent(a)}, ${quoteIdent(b)})) AS c FROM ${quoteIdent(tableName)}`
+        `SELECT ${idx} AS idx, corr(${quoteIdent(a)}, ${quoteIdent(b)}) AS r FROM ${quoteIdent(tableName)}`
     )
     .join(' UNION ALL ');
-  const result: any = await db.query(`${selects} ORDER BY c DESC NULLS LAST LIMIT 1`, {
+  // UNION の結果に式（abs）で ORDER BY するには、UNION をサブクエリに包む必要がある
+  const result: any = await db.query(`SELECT * FROM (${selects}) ORDER BY abs(r) DESC NULLS LAST LIMIT 1`, {
     cache: false,
   });
   const rows = result.toArray();
-  if (rows.length === 0) return [numericCols[0], numericCols[1]];
-  return pairs[Number(rows[0].idx)];
+  if (rows.length === 0) return { x: numericCols[0], y: numericCols[1], r: null };
+  const [x, y] = pairs[Number(rows[0].idx)];
+  const r = rows[0].r === null ? null : Number(rows[0].r);
+  return { x, y, r };
 }
 
 // 母集団のうち選択されていない部分を描く背景色。Spotfire のマーキングと
@@ -84,6 +88,10 @@ export async function pickBestAxisPair(
 const BACKGROUND_FILL = '#d4d8de';
 // 色分けしないときの前景色（style.css の --accent と揃える）
 const ACCENT_FILL = '#2563eb';
+// ブラシ（選択範囲の枠）の見た目。既定の濃い灰色の塗りだと枠の中の
+// 選択中の点がくすんで見えるため、薄いアクセント色の塗りと枠線にする。
+// 属性として付くので、図の書き出し（export.ts）にもそのまま反映される
+const BRUSH_STYLE = { fill: ACCENT_FILL, fillOpacity: 0.07, stroke: ACCENT_FILL, strokeWidth: 1.5 };
 
 export interface ScatterConfig {
   tableName: string;
@@ -92,7 +100,10 @@ export interface ScatterConfig {
   colorCol: string | null;
   rowCount: number;
   population: Selection; // フィルタ後の母集団（$filter）
-  brush: Selection; // チャート間のマーキング（$brush）
+  brush: Selection; // チャート間のマーキング（$brush、crossfilter）
+  // 散布図自身の範囲選択も含めた選択（$selected、intersect）。回帰直線用
+  selected: Selection;
+  showRegression: boolean;
   plotName: string; // 凡例を紐づけるための名前
   width: number;
   height: number;
@@ -130,9 +141,36 @@ export function buildScatterPlot(cfg: ScatterConfig): HTMLElement {
         }),
       ];
 
+  // 回帰直線: 母集団（灰）と選択中（アクセント色）の2本。選択中の直線は
+  // $brush ではなく $selected で絞る。$brush は crossfilter なので、散布図
+  // 自身の範囲選択が散布図上のマークには効かず、散布図で囲んだ範囲の
+  // 直線が引けないため（intersect の $selected なら自身の選択も効く）
+  const regression = cfg.showRegression
+    ? [
+        regressionY(from(cfg.tableName, { filterBy: cfg.population }), {
+          x: cfg.x,
+          y: cfg.y,
+          stroke: '#7b8494',
+          strokeWidth: 1.5,
+          strokeDasharray: '5 3',
+          fill: '#7b8494',
+          fillOpacity: 0.12,
+        }),
+        regressionY(from(cfg.tableName, { filterBy: cfg.selected }), {
+          x: cfg.x,
+          y: cfg.y,
+          stroke: '#1d4ed8',
+          strokeWidth: 2.5,
+          fill: '#1d4ed8',
+          fillOpacity: 0.15,
+        }),
+      ]
+    : [];
+
   return plot(
     ...marks,
-    intervalXY({ as: cfg.brush }),
+    ...regression,
+    intervalXY({ as: cfg.brush, brush: BRUSH_STYLE }),
     name(cfg.plotName),
     xLabel(`${cfg.x} →`),
     yLabel(`↑ ${cfg.y}`),
@@ -173,7 +211,7 @@ export function buildHistogram(
       fill: ACCENT_FILL,
       inset: 0.5,
     }),
-    intervalX({ as: brush }),
+    intervalX({ as: brush, brush: BRUSH_STYLE }),
     xLabel(`${column} →`),
     yLabel('件数'),
     width(size.width),

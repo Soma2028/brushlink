@@ -1,9 +1,14 @@
-// 件数と要約統計量（CLAUDE.md「次にやること」3）。
+// 件数・要約統計量・群間比較（CLAUDE.md「次にやること」3・4）。
 //
 // 選択中（$brush）と母集団（$filter）それぞれに Mosaic クライアントを1つずつ
 // 繋ぎ、フィルタやドラッグのたびに SQL 集計を DuckDB に投げ直す。
 // 集計はすべて DuckDB 側で行い、JS 側へは1行の結果だけを持ってくる
 // （行データを JS に取り出すと 100万行規模で破綻するため）。
+//
+// 群間比較は「選択中 vs 選択外（母集団の残り）」の2群で行う。クロスフィルタで
+// 範囲を選ぶ行為そのものが「この群は他と何が違うか」という問いなので、
+// 比較の相手は母集団全体ではなく残りの行にする（母集団全体と比べると、
+// 選択中が両方の群に含まれてしまい検定として成り立たない）。
 //
 // 欠測件数は Python版と同様に常に見える形にする。測定漏れがあるデータが
 // 前提であり、平均などの値が「何件の値から計算されたか」を並べて示さないと
@@ -11,14 +16,17 @@
 
 import { makeClient } from '@uwdata/mosaic-core';
 import type { Selection } from '@uwdata/mosaic-core';
-import { Query, count, avg, stddev, min, max, median } from '@uwdata/mosaic-sql';
+import { Query, count, avg, variance, min, max, median } from '@uwdata/mosaic-sql';
 import type { Coordinator } from '@uwdata/vgplot';
+import { welchTTest, subtractGroup, formatP, effectLabel } from './inference';
+import type { WelchResult } from './inference';
+import { escapeHtml, helpTip } from './dom';
 
 export interface ColumnStats {
   n: number; // 非欠測の件数
   missing: number;
   mean: number | null;
-  sd: number | null;
+  variance: number | null; // 不偏分散。群間比較（選択外の分散の逆算）に使う
   min: number | null;
   median: number | null;
   max: number | null;
@@ -45,7 +53,7 @@ function statsQuery(tableName: string, cols: string[], filter: any) {
   cols.forEach((c, i) => {
     select[`n${i}`] = count(c);
     select[`mean${i}`] = avg(c);
-    select[`sd${i}`] = stddev(c);
+    select[`var${i}`] = variance(c);
     select[`min${i}`] = min(c);
     select[`med${i}`] = median(c);
     select[`max${i}`] = max(c);
@@ -64,18 +72,13 @@ function parseStats(cols: string[], data: any): StatsSnapshot {
         n,
         missing: rows - n,
         mean: toNumberOrNull(row[`mean${i}`]),
-        sd: toNumberOrNull(row[`sd${i}`]),
+        variance: toNumberOrNull(row[`var${i}`]),
         min: toNumberOrNull(row[`min${i}`]),
         median: toNumberOrNull(row[`med${i}`]),
         max: toNumberOrNull(row[`max${i}`]),
       };
     }),
   };
-}
-
-export interface CountState {
-  selected: number | null;
-  population: number | null;
 }
 
 /**
@@ -93,7 +96,7 @@ export function connectStatsClients(
   tableName: string,
   numericCols: string[],
   $filter: Selection,
-  $brush: Selection,
+  $selected: Selection,
   onUpdate: (selected: StatsSnapshot | null, population: StatsSnapshot | null) => void
 ) {
   let selected: StatsSnapshot | null = null;
@@ -101,6 +104,10 @@ export function connectStatsClients(
 
   makeClient({
     coordinator: db,
+    // 事前集計（preaggregation）を使わせない。Mosaic の事前集計はブラシの
+    // 範囲を画面のピクセル単位に丸めて集計するため、描画には十分でも
+    // 件数や平均が厳密な値から1件単位でずれる（統計量として出す値には不適）
+    filterStable: false,
     selection: $filter,
     query: (filter) => statsQuery(tableName, numericCols, filter),
     queryResult: (data) => {
@@ -110,12 +117,65 @@ export function connectStatsClients(
   });
   makeClient({
     coordinator: db,
-    selection: $brush,
+    filterStable: false, // 上と同じ理由で事前集計を使わせない
+    selection: $selected,
     query: (filter) => statsQuery(tableName, numericCols, filter),
     queryResult: (data) => {
       selected = parseStats(numericCols, data);
       onUpdate(selected, population);
     },
+  });
+}
+
+/**
+ * 選択件数だけを数える軽いクライアント。統計量はドラッグが止まってから
+ * 集計する（settle.ts）が、件数はドラッグ中も手元で増減が見えてほしいので、
+ * count(*) だけを即時に数え直す（5万行でも数ミリ秒で済む）。
+ */
+export function connectLiveCount(
+  db: Coordinator,
+  tableName: string,
+  $selected: Selection,
+  onUpdate: (n: number) => void
+) {
+  makeClient({
+    coordinator: db,
+    filterStable: false, // 統計量の件数と1件単位で一致させるため、事前集計を使わせない
+    selection: $selected,
+    query: (filter) => Query.from(tableName).select({ n: count() }).where(filter),
+    queryResult: (data: any) => onUpdate(Number(data.get(0).n)),
+  });
+}
+
+export interface NumericComparison {
+  column: string;
+  selMean: number | null;
+  restMean: number | null;
+  restN: number;
+  test: WelchResult | null;
+}
+
+/** 列ごとに選択中と選択外（母集団 − 選択中）を比べる。 */
+export function compareNumeric(
+  cols: string[],
+  selected: StatsSnapshot,
+  population: StatsSnapshot
+): NumericComparison[] {
+  return cols.map((column, i) => {
+    const s = selected.columns[i];
+    const p = population.columns[i];
+    if (s.mean === null || p.mean === null || p.variance === null) {
+      return { column, selMean: s.mean, restMean: null, restN: p.n - s.n, test: null };
+    }
+    const selGroup = { n: s.n, mean: s.mean, variance: s.variance ?? 0 };
+    const rest = subtractGroup({ n: p.n, mean: p.mean, variance: p.variance }, selGroup);
+    return {
+      column,
+      selMean: s.mean,
+      restMean: rest?.mean ?? null,
+      restN: rest?.n ?? 0,
+      test: rest ? welchTTest(selGroup, rest) : null,
+    };
   });
 }
 
@@ -133,87 +193,102 @@ export function formatStat(v: number | null): string {
   return v.toLocaleString('ja-JP', { maximumFractionDigits: digits });
 }
 
-// 標準化差をバーで表示するときの端。これを超える偏りは端に張り付かせる
-// （1.5 SD 以上ずれていれば、目で見て「大きく偏っている」と分かれば十分なため）。
+// 効果量をバーで表示するときの端。これを超える差は端に張り付かせる
+// （1.5 SD 以上ずれていれば、目で見て「大きく違う」と分かれば十分なため）。
 const EFFECT_CLIP = 1.5;
 
-function escapeHtml(value: string): string {
-  const div = document.createElement('div');
-  div.textContent = value;
-  return div.innerHTML;
+function effectBar(d: number): string {
+  const clipped = Math.max(-EFFECT_CLIP, Math.min(EFFECT_CLIP, d));
+  const pct = (Math.abs(clipped) / EFFECT_CLIP) * 50;
+  const side = d >= 0 ? `left:50%;width:${pct}%` : `left:${50 - pct}%;width:${pct}%`;
+  const strength = { なし: 'weak', 小: 'weak', 中: 'medium', 大: 'strong' }[effectLabel(d)];
+  return `<div class="effect-track"><div class="effect-bar ${d >= 0 ? 'pos' : 'neg'} ${strength}" style="${side}"></div></div>`;
 }
 
 /**
  * 要約統計量の表を描画する。行 = 数値列。
  *
- * 選択中の値を主に並べ、最後に「母集団との差」を標準化差
- * （(選択平均 − 母集団平均) / 母集団SD）で示す。生の差だと列ごとに
- * 単位が違って比べられないため、SD 単位に揃えて「どの列が選択によって
- * 最も偏ったか」を一目で拾えるようにする（探索的分析の入口として）。
- * 検定ではないので p 値は出さない（群間比較は「次にやること」4 で扱う）。
+ * 選択があるときは右側に「選択外の平均」「差（効果量 d）」「p 値」を並べる。
+ * 生の平均差だと列ごとに単位が違って比べられないため、効果量（SD 単位）で
+ * 「どの列が最も違うか」を一目で拾えるようにする。
+ *
+ * チャートで範囲を選ぶのに使った列には「選択に使用」の印を付ける。
+ * その列で選んだのだから差が出るのは当然で、p 値は意味を持たない
+ * （見た目で選んだ範囲に検定をかけると必ず有意になる）ことを明示するため。
  */
 export function renderStatsTable(
   container: HTMLElement,
   cols: string[],
-  selected: StatsSnapshot | null,
-  population: StatsSnapshot | null
+  selected: StatsSnapshot,
+  population: StatsSnapshot,
+  brushedCols: Set<string>,
+  hasSelection: boolean
 ) {
-  if (!selected || !population) return;
-  const isSubset = selected.rows < population.rows;
+  const comparisons = hasSelection ? compareNumeric(cols, selected, population) : [];
 
   const body = cols
     .map((c, i) => {
       const s = selected.columns[i];
-      const p = population.columns[i];
       const missingRate = selected.rows > 0 ? s.missing / selected.rows : 0;
       const missingCell =
         s.missing > 0
-          ? `<span class="missing-badge" title="選択中 ${selected.rows.toLocaleString()} 件のうち ${s.missing.toLocaleString()} 件が欠測">${s.missing.toLocaleString()}<small>（${(missingRate * 100).toFixed(1)}%）</small></span>`
+          ? `<span class="missing-badge" title="${selected.rows.toLocaleString()} 件のうち ${s.missing.toLocaleString()} 件が欠測">${s.missing.toLocaleString()}<small>（${(missingRate * 100).toFixed(1)}%）</small></span>`
           : `<span class="muted">0</span>`;
+      const brushedTag = brushedCols.has(c) ? '<span class="tag">選択に使用</span>' : '';
 
-      let effectCell = '<span class="muted">—</span>';
-      if (isSubset && s.mean !== null && p.mean !== null && p.sd && p.sd > 0) {
-        const d = (s.mean - p.mean) / p.sd;
-        const clipped = Math.max(-EFFECT_CLIP, Math.min(EFFECT_CLIP, d));
-        const pct = (Math.abs(clipped) / EFFECT_CLIP) * 50;
-        const side = d >= 0 ? `left:50%;width:${pct}%` : `left:${50 - pct}%;width:${pct}%`;
-        const strength = Math.abs(d) >= 0.8 ? 'strong' : Math.abs(d) >= 0.3 ? 'medium' : 'weak';
-        effectCell = `
-          <div class="effect" title="選択中の平均は母集団より ${d >= 0 ? '+' : ''}${d.toFixed(2)} SD">
-            <div class="effect-track"><div class="effect-bar ${d >= 0 ? 'pos' : 'neg'} ${strength}" style="${side}"></div></div>
-            <span class="effect-value">${d >= 0 ? '+' : ''}${d.toFixed(2)}</span>
-          </div>`;
+      let compareCells = '';
+      if (hasSelection) {
+        const cmp = comparisons[i];
+        const test = cmp.test;
+        const effectCell = test
+          ? `<div class="effect" title="選択中の平均は選択外より ${test.d >= 0 ? '+' : ''}${test.d.toFixed(2)} SD（効果量: ${effectLabel(test.d)}）">
+               ${effectBar(test.d)}<span class="effect-value">${test.d >= 0 ? '+' : ''}${test.d.toFixed(2)}</span>
+             </div>`
+          : '<span class="muted">—</span>';
+        const pCell = test
+          ? brushedCols.has(c)
+            ? `<span class="muted" title="選択に使った列なので検定の意味がありません">（${formatP(test.p)}）</span>`
+            : `<span class="${test.p < 0.05 ? 'sig' : 'muted'}">${formatP(test.p)}</span>`
+          : '<span class="muted">—</span>';
+        compareCells = `
+          <td class="rest-col">${formatStat(cmp.restMean)}</td>
+          <td class="effect-col">${effectCell}</td>
+          <td>${pCell}</td>`;
       }
 
       return `<tr>
-        <th scope="row">${escapeHtml(c)}</th>
+        <th scope="row">${escapeHtml(c)}${brushedTag}</th>
         <td>${s.n.toLocaleString()}</td>
         <td>${missingCell}</td>
-        <td>${formatStat(s.mean)}</td>
-        <td>${formatStat(s.sd)}</td>
+        <td class="strong">${formatStat(s.mean)}</td>
+        <td>${formatStat(s.variance === null ? null : Math.sqrt(s.variance))}</td>
         <td>${formatStat(s.min)}</td>
         <td>${formatStat(s.median)}</td>
         <td>${formatStat(s.max)}</td>
-        <td class="pop-col">${formatStat(p.mean)}</td>
-        <td class="effect-col">${effectCell}</td>
+        ${compareCells}
       </tr>`;
     })
     .join('');
+
+  const compareHead = hasSelection
+    ? `<th scope="col" class="rest-col">選択外の平均</th>
+       <th scope="col" class="effect-col">差（効果量 d）${helpTip('選択中と選択外の平均の差を、両群をまとめた標準偏差で割った値。単位の違う列どうしでも比べられる。目安は 0.2 小・0.5 中・0.8 大。')}</th>
+       <th scope="col">p 値${helpTip('Welch の t 検定。差が偶然で生じる確率の目安で、0.05 未満なら「偶然とは考えにくい」とされる。件数が多いと小さな差でも小さくなるので、差の大きさは効果量 d で見る。')}</th>`
+    : '';
 
   container.innerHTML = `
     <table class="stats-table">
       <thead>
         <tr>
           <th scope="col">列</th>
-          <th scope="col" title="欠測を除いた件数">n</th>
-          <th scope="col">欠測</th>
+          <th scope="col">n${helpTip('欠測を除いた、実際に値がある件数。')}</th>
+          <th scope="col">欠測${helpTip('値が空の件数。平均などはこの行を除いて計算している。')}</th>
           <th scope="col">平均</th>
-          <th scope="col" title="標本標準偏差">SD</th>
+          <th scope="col">SD${helpTip('標準偏差。値のばらつきの大きさ。')}</th>
           <th scope="col">最小</th>
           <th scope="col">中央値</th>
           <th scope="col">最大</th>
-          <th scope="col" class="pop-col">母集団の平均</th>
-          <th scope="col" class="effect-col" title="(選択中の平均 − 母集団の平均) ÷ 母集団のSD">母集団との差（SD）</th>
+          ${compareHead}
         </tr>
       </thead>
       <tbody>${body}</tbody>

@@ -17,6 +17,7 @@ import type { Coordinator } from '@uwdata/vgplot';
 import { Selection } from '@uwdata/mosaic-core';
 import { or, isBetween, isIn, isNull, literal } from '@uwdata/mosaic-sql';
 import type { SelectionClause } from '@uwdata/mosaic-core';
+import { quoteIdent } from './sql';
 
 // チェックボックス・色分けの対象から外す、カテゴリ列の最大ユニーク値数。
 // 根拠: Bokeh の既定カテゴリパレット Category20 が持つ色数（20）。
@@ -35,10 +36,6 @@ const NUMERIC_TYPE_RE =
 
 export function isNumericType(duckType: string): boolean {
   return NUMERIC_TYPE_RE.test(duckType);
-}
-
-function quoteIdent(name: string): string {
-  return `"${name.replace(/"/g, '""')}"`;
 }
 
 export interface ClassifiedColumns {
@@ -175,7 +172,8 @@ export async function buildFilterPanel(
   tableName: string,
   cols: ClassifiedColumns,
   filterSelection: Selection,
-  onMissingIncludedChange: (entries: MissingIncludedEntry[]) => void
+  onMissingIncludedChange: (entries: MissingIncludedEntry[]) => void,
+  onActiveChange: (descriptions: string[]) => void = () => {}
 ): Promise<FilterPanel> {
   const container = document.createElement('div');
   const numeric: NumericFilter[] = [];
@@ -213,6 +211,12 @@ export async function buildFilterPanel(
 
   // 各フィルタの「初期状態に戻す」処理。パネル全体のリセットボタンから呼ぶ
   const resetters: (() => void)[] = [];
+  // 各フィルタの現在の条件を短い文にする処理。効いていなければ null。
+  // 件数の横に「いま何で絞っているか」を出すのと、書き出す図の注記に使う
+  const describers: (() => string | null)[] = [];
+  function notifyActive() {
+    onActiveChange(describers.map((d) => d()).filter((d): d is string => d !== null));
+  }
 
   /**
    * 「欠測を含める」チェックボックスを作る。欠測が実在しない列には出さない
@@ -318,7 +322,13 @@ export async function buildFilterPanel(
       const narrowed = a > lo || b < hi || includeNullsByCol.get(col) === false;
       wrap.classList.toggle('is-active', narrowed);
       filterSelection.update(numericRangeClause(col, a, b, source, includeNullsByCol.get(col) ?? true));
+      current = narrowed
+        ? `${col}: ${formatNumber(a)}〜${formatNumber(b)}${includeNullsByCol.get(col) === false ? '（欠測を除く）' : ''}`
+        : null;
+      notifyActive();
     };
+    let current: string | null = null;
+    describers.push(() => current);
     lowInput.addEventListener('input', publish);
     highInput.addEventListener('input', publish);
     valueLabel.textContent = `${formatNumber(lo)} 〜 ${formatNumber(hi)}`;
@@ -365,7 +375,14 @@ export async function buildFilterPanel(
       const narrowed = selected.length < options.length || includeNullsByCol.get(col) === false;
       wrap.classList.toggle('is-active', narrowed);
       filterSelection.update(categoryInClause(col, selected, source, includeNullsByCol.get(col) ?? true));
+      const shown = selected.length <= 3 ? selected.join('・') || 'なし' : `${selected.length}/${options.length} 種`;
+      current = narrowed
+        ? `${col}: ${shown}${includeNullsByCol.get(col) === false ? '（欠測を除く）' : ''}`
+        : null;
+      notifyActive();
     };
+    let current: string | null = null;
+    describers.push(() => current);
     for (const opt of options) {
       const optLabel = document.createElement('label');
       optLabel.className = 'filter-checkbox';
