@@ -1,37 +1,12 @@
-// ブラウザ内完結版の技術検証（Vite + TypeScript）。
-// 確認する3点:
-//   1. DuckDB-WASM の初期化 + CSV 読み込み + SELECT
-//   2. Mosaic での散布図・ヒストグラムの範囲選択連動
-//   3. 選択された行数の表示
-// 加えて、データ量を増やしたときの限界を計測する（行数は ?n= で切り替え）:
-//   - CSV を DuckDB-WASM に登録し終わるまでの時間
-//   - 初回の散布図描画にかかる時間
-//   - ドラッグ選択に対する件数更新の応答時間（driver 側で計測、ここは時刻を晒すだけ）
-//   - ブラウザのメモリ使用量（performance.memory、Chrome 限定の概算値）
-// 見た目・UI の作り込み・統計機能・Excel 対応はしない。行数切り替えも
-// URL パラメータのみで、専用 UI は作らない。
+// Brushlink Web版。
+//
+// CLAUDE.md「次にやること」1（ファイル読み込み）・2（軸選択とフィルタパネル）。
+// 検証用に使っていた合成データの 'points' テーブルはもう使わない。
+// 散布図の対象は、画面からアップロードしたテーブル（'uploaded'）にする。
 
 import './style.css';
 import { makeClient } from '@uwdata/mosaic-core';
-import {
-  DuckDBWASMConnector,
-  coordinator,
-  Selection,
-  Query,
-  count,
-  bin,
-  from,
-  plot,
-  dot,
-  rectY,
-  raster,
-  hexbin,
-  intervalX,
-  intervalXY,
-  loadCSV,
-  width,
-  height,
-} from '@uwdata/vgplot';
+import { DuckDBWASMConnector, coordinator, Selection, Query, count } from '@uwdata/vgplot';
 import type { Coordinator } from '@uwdata/vgplot';
 import type * as duckdbWasm from '@duckdb/duckdb-wasm';
 import {
@@ -42,82 +17,17 @@ import {
   rowsToCsv,
   registerCsvTable,
 } from './upload';
-
-type MarkKind = 'dot' | 'raster' | 'hexbin';
-
-// --- 計測結果。Playwright など外部の driver から読めるよう window に生やす ---
-interface Metrics {
-  n: number;
-  genMs: number | null;
-  loadMs: number | null;
-  markKind: MarkKind;
-  firstRenderMs: number | null;
-  scatterDomNodes: number | null;
-  memBaselineBytes: number | null;
-  memAfterLoadBytes: number | null;
-  memAfterRenderBytes: number | null;
-  // ドラッグ選択の応答時間は driver 側が計測する。ここでは
-  // 「選択結果が反映された時刻」を performance.now() で晒すだけ
-  // （page/driver 間の時計ずれを避けるため、両方とも page 内の
-  // performance.now() で揃える）。
-  lastSelectionAppliedAt: number | null;
-}
-
-const metrics: Metrics = {
-  n: 0,
-  genMs: null,
-  loadMs: null,
-  markKind: 'dot',
-  firstRenderMs: null,
-  scatterDomNodes: null,
-  memBaselineBytes: memSnapshot(),
-  memAfterLoadBytes: null,
-  memAfterRenderBytes: null,
-  lastSelectionAppliedAt: null,
-};
-(window as any).__metrics = metrics;
-
-function memSnapshot(): number | null {
-  const m = (performance as any).memory;
-  return m ? m.usedJSHeapSize : null;
-}
-
-function getRowCountFromUrl(): number {
-  const raw = new URLSearchParams(location.search).get('n');
-  const n = raw ? Number(raw) : 300;
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 300;
-}
-
-// dot（1点=1DOMノード）と、DuckDB 側で集計してから描く raster / hexbin を
-// 切り替えて比較する。専用 UI は作らず ?mark= のみで切り替える。
-function getMarkKindFromUrl(): MarkKind {
-  const raw = new URLSearchParams(location.search).get('mark');
-  return raw === 'raster' || raw === 'hexbin' ? raw : 'dot';
-}
-
-// 散布図側に使うマーク本体を組み立てる。dot 以外は DuckDB 側で
-// グリッド/ヘキサゴン単位に集計してから描画するため、DOM ノード数が
-// 行数から切り離されることを比較したい。
-function buildScatterMark(kind: MarkKind, filterBy: ReturnType<typeof Selection.crossfilter>) {
-  const source = from('points', { filterBy });
-  switch (kind) {
-    case 'raster':
-      return raster(source, { x: 'x', y: 'y' });
-    case 'hexbin':
-      return hexbin(source, { x: 'x', y: 'y', fill: count(), binWidth: 10 });
-    case 'dot':
-    default:
-      return dot(source, { x: 'x', y: 'y', fill: 'group' });
-  }
-}
+import type { LoadedTable } from './upload';
+import { classifyColumns, buildFilterPanel, newFilterSelection } from './filters';
+import { pickBestAxisPair, buildScatterPlot, buildHistogram, DOT_TO_RASTER_THRESHOLD } from './charts';
 
 document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
   <h1>Brushlink — Web 版</h1>
 
   <section id="upload-section">
     <h2>ファイル読み込み</h2>
-    <div id="dropzone" tabindex="0">
-      ここに CSV / Excel(.xlsx) をドラッグ＆ドロップ、またはクリックして選択
+    <div id="dropzone" tabindex="0" class="disabled">
+      DuckDB-WASM を初期化中…
     </div>
     <input type="file" id="fileInput" accept=".csv,.xlsx,.xls" hidden />
     <div id="uploadStatus"></div>
@@ -129,25 +39,23 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
     <div id="uploadResult"></div>
   </section>
 
-  <section id="demo-section">
-    <h2>技術検証（データ量の限界計測）</h2>
-    <p>行数・マーク種別は URL パラメータで切り替える
-       （例: <code>?n=1000000&amp;mark=raster</code>）。既定は 300 行 / dot。
-       mark は dot / raster / hexbin。</p>
-    <div id="status"></div>
-    <p>選択中: <span id="count">-</span></p>
+  <section id="chart-section">
+    <h2>散布図</h2>
+    <div id="axisControls" hidden>
+      <label>X軸 <select id="xAxisSelect"></select></label>
+      <label>Y軸 <select id="yAxisSelect"></select></label>
+    </div>
+    <div id="chartStatus"></div>
+    <p id="countLine" hidden>
+      選択中: <span id="selectedCount">-</span> /
+      母集団: <span id="populationCount">-</span> /
+      全体: <span id="totalCount">-</span> 件
+    </p>
+    <div id="filterExclusionNote"></div>
+    <div id="filterPanel"></div>
     <div id="plots"></div>
   </section>
 `;
-
-const statusEl = document.querySelector<HTMLDivElement>('#status')!;
-const countEl = document.querySelector<HTMLSpanElement>('#count')!;
-const plotsEl = document.querySelector<HTMLDivElement>('#plots')!;
-
-function log(line: string) {
-  console.log(line);
-  statusEl.textContent += (statusEl.textContent ? '\n' : '') + line;
-}
 
 const dropzoneEl = document.querySelector<HTMLDivElement>('#dropzone')!;
 const fileInputEl = document.querySelector<HTMLInputElement>('#fileInput')!;
@@ -156,9 +64,26 @@ const previewHintEl = document.querySelector<HTMLParagraphElement>('#previewHint
 const previewTableEl = document.querySelector<HTMLTableElement>('#previewTable')!;
 const uploadResultEl = document.querySelector<HTMLDivElement>('#uploadResult')!;
 
+const axisControlsEl = document.querySelector<HTMLDivElement>('#axisControls')!;
+const xAxisSelectEl = document.querySelector<HTMLSelectElement>('#xAxisSelect')!;
+const yAxisSelectEl = document.querySelector<HTMLSelectElement>('#yAxisSelect')!;
+const chartStatusEl = document.querySelector<HTMLDivElement>('#chartStatus')!;
+const countLineEl = document.querySelector<HTMLParagraphElement>('#countLine')!;
+const selectedCountEl = document.querySelector<HTMLSpanElement>('#selectedCount')!;
+const populationCountEl = document.querySelector<HTMLSpanElement>('#populationCount')!;
+const totalCountEl = document.querySelector<HTMLSpanElement>('#totalCount')!;
+const filterExclusionNoteEl = document.querySelector<HTMLDivElement>('#filterExclusionNote')!;
+const filterPanelEl = document.querySelector<HTMLDivElement>('#filterPanel')!;
+const plotsEl = document.querySelector<HTMLDivElement>('#plots')!;
+
 function setUploadStatus(message: string, isError: boolean) {
   uploadStatusEl.textContent = message;
   uploadStatusEl.style.color = isError ? 'crimson' : 'inherit';
+}
+
+function setChartStatus(message: string, isError: boolean) {
+  chartStatusEl.textContent = message;
+  chartStatusEl.style.color = isError ? 'crimson' : 'inherit';
 }
 
 // アップロードされたファイルの中身（セル値・列名）をそのまま innerHTML に
@@ -204,6 +129,147 @@ function renderPreview(
   });
 }
 
+function populateAxisSelect(select: HTMLSelectElement, cols: string[], selected: string) {
+  select.innerHTML = cols
+    .map((c) => `<option value="${escapeHtml(c)}" ${c === selected ? 'selected' : ''}>${escapeHtml(c)}</option>`)
+    .join('');
+}
+
+/**
+ * アップロード成功後、軸選択・フィルタパネル・散布図/ヒストグラムを組み立てる。
+ *
+ * 別ファイルを読み込むたびに呼ばれる。$filter・$brush は毎回新しく作り直し、
+ * 古い列に対する条件が新しいテーブルに引き継がれないようにする。
+ * db.clear() で古い散布図・ヒストグラム・件数表示クライアントも切断する
+ * （フィルタ用ウィジェット自体は MosaicClient として登録していないため
+ * 影響を受けない。$filter Selection オブジェクトはこの関数のクロージャに
+ * 閉じているだけで、切断の対象にはならない）。
+ */
+function connectCountClients(
+  db: Coordinator,
+  tableName: string,
+  $filter: Selection,
+  $brush: Selection
+) {
+  makeClient({
+    coordinator: db,
+    selection: $filter,
+    query: (filter) => Query.from(tableName).select({ n: count() }).where(filter),
+    queryResult: (data: any) => {
+      populationCountEl.textContent = Number(data.get(0).n).toLocaleString();
+    },
+  });
+  makeClient({
+    coordinator: db,
+    selection: $brush,
+    query: (filter) => Query.from(tableName).select({ n: count() }).where(filter),
+    queryResult: (data: any) => {
+      selectedCountEl.textContent = Number(data.get(0).n).toLocaleString();
+    },
+  });
+}
+
+async function setupChartsAndFilters(db: Coordinator, table: LoadedTable) {
+  setChartStatus('列を調べています…', false);
+  countLineEl.hidden = true;
+  axisControlsEl.hidden = true;
+  filterExclusionNoteEl.textContent = '';
+  filterPanelEl.innerHTML = '';
+  plotsEl.innerHTML = '';
+
+  db.clear(); // 古いチャート・件数クライアントを切断する（既定で clients・cache とも true）
+
+  let cols;
+  try {
+    cols = await classifyColumns(db, table.tableName, table.columns);
+  } catch (e) {
+    setChartStatus(
+      `⚠️ 列の分類に失敗しました: ${e instanceof Error ? e.message : String(e)}`,
+      true
+    );
+    return;
+  }
+
+  if (cols.highCardCols.length > 0) {
+    const detail = cols.highCardCols
+      .map((c) => `${escapeHtml(c.name)}（${c.cardinality.toLocaleString()}種）`)
+      .join('、');
+    filterExclusionNoteEl.textContent = `⚠️ 高カーディナリティ列をフィルタ・色分けから除外: ${detail}`;
+  }
+
+  const $filter = newFilterSelection();
+  const $brush = Selection.crossfilter({ include: [$filter] });
+
+  try {
+    const panel = await buildFilterPanel(db, table.tableName, cols, $filter);
+    filterPanelEl.appendChild(panel.element);
+  } catch (e) {
+    setChartStatus(
+      `⚠️ フィルタパネルの構築に失敗しました: ${e instanceof Error ? e.message : String(e)}`,
+      true
+    );
+    return;
+  }
+
+  totalCountEl.textContent = table.rowCount.toLocaleString();
+  countLineEl.hidden = false;
+
+  if (cols.numericCols.length < 2) {
+    connectCountClients(db, table.tableName, $filter, $brush);
+    setChartStatus('散布図を描くには数値列が2つ以上必要です（フィルタのみ利用できます）。', false);
+    return;
+  }
+
+  let x: string, y: string;
+  try {
+    [x, y] = await pickBestAxisPair(db, table.tableName, cols.numericCols);
+  } catch (e) {
+    setChartStatus(
+      `⚠️ 軸の自動選択に失敗しました: ${e instanceof Error ? e.message : String(e)}`,
+      true
+    );
+    return;
+  }
+
+  populateAxisSelect(xAxisSelectEl, cols.numericCols, x);
+  populateAxisSelect(yAxisSelectEl, cols.numericCols, y);
+  axisControlsEl.hidden = false;
+
+  const colorCol = cols.catCols[0] ?? null;
+  const useRaster = table.rowCount >= DOT_TO_RASTER_THRESHOLD;
+
+  function rebuildScatterAndHist() {
+    db.clear(); // 軸を変えるたびに、直前の散布図・ヒストグラム・件数クライアントを切断する
+    plotsEl.innerHTML = '';
+
+    const xCol = xAxisSelectEl.value;
+    const yCol = yAxisSelectEl.value;
+
+    const scatter = buildScatterPlot({
+      tableName: table.tableName,
+      x: xCol,
+      y: yCol,
+      colorCol,
+      rowCount: table.rowCount,
+      filterBy: $brush,
+    });
+    const hist = buildHistogram(table.tableName, xCol, $brush);
+    plotsEl.append(scatter, hist);
+
+    connectCountClients(db, table.tableName, $filter, $brush);
+
+    setChartStatus(
+      `散布図: X=${xCol} / Y=${yCol}（${useRaster ? 'raster' : 'dot'} で描画、行数 ${table.rowCount.toLocaleString()}）`,
+      false
+    );
+  }
+
+  xAxisSelectEl.addEventListener('change', rebuildScatterAndHist);
+  yAxisSelectEl.addEventListener('change', rebuildScatterAndHist);
+
+  rebuildScatterAndHist();
+}
+
 /**
  * ドロップ領域・ファイル選択・ヘッダ行クリックの一連を配線する。
  *
@@ -243,6 +309,8 @@ function setupUpload(db: Coordinator, duckdb: duckdbWasm.AsyncDuckDB) {
       uploadResultEl.innerHTML = `
         <table><thead><tr><th>列名</th><th>DuckDBの型</th></tr></thead><tbody>${columnRows}</tbody></table>
       `;
+
+      await setupChartsAndFilters(db, table);
     } catch (e) {
       showError(e);
     }
@@ -297,136 +365,16 @@ function setupUpload(db: Coordinator, duckdb: duckdbWasm.AsyncDuckDB) {
   });
 }
 
-// --- サンプル CSV をその場で生成する（外部ファイル取得を経路から外し、
-//     「DuckDB-WASM への登録そのもの」の時間だけを計測できるようにする） ---
-function makeSampleCsv(n: number): { csv: string; genMs: number } {
-  const t0 = performance.now();
-  const rows = new Array<string>(n + 1);
-  rows[0] = 'x,y,group';
-  for (let i = 0; i < n; i++) {
-    const group = i % 3 === 0 ? 'A' : i % 3 === 1 ? 'B' : 'C';
-    const x = Math.round((Math.random() * 100 + (group === 'A' ? 20 : 0)) * 100) / 100;
-    const y = Math.round((x * 0.6 + Math.random() * 30) * 100) / 100;
-    rows[i + 1] = `${x},${y},${group}`;
-  }
-  const csv = rows.join('\n');
-  return { csv, genMs: performance.now() - t0 };
-}
-
-// 対象要素の中に最初の <svg> が現れるまでの時間を計る（初回描画の完了とみなす）。
-function waitForFirstSvg(target: Element, timeoutMs = 180_000): Promise<number> {
-  const t0 = performance.now();
-  return new Promise((resolve, reject) => {
-    if (target.querySelector('svg')) {
-      resolve(performance.now() - t0);
-      return;
-    }
-    const timer = setTimeout(() => {
-      obs.disconnect();
-      reject(new Error(`初回描画が ${timeoutMs}ms 以内に終わりませんでした`));
-    }, timeoutMs);
-    const obs = new MutationObserver(() => {
-      if (target.querySelector('svg')) {
-        clearTimeout(timer);
-        obs.disconnect();
-        resolve(performance.now() - t0);
-      }
-    });
-    obs.observe(target, { childList: true, subtree: true });
-  });
-}
-
 async function main() {
-  const n = getRowCountFromUrl();
-  const markKind = getMarkKindFromUrl();
-  metrics.n = n;
-  metrics.markKind = markKind;
-  log(`行数: ${n.toLocaleString()} / マーク: ${markKind}`);
-
-  // --- 1. DuckDB-WASM の初期化 + CSV 読み込み + SELECT -------------------
-  log('[1] DuckDB-WASM を初期化中…');
   const connector = new DuckDBWASMConnector();
   const db = coordinator();
   db.databaseConnector(connector);
-  await connector.getDuckDB(); // ここで WASM 本体の初期化を先に済ませておく
-
-  const { csv: csvText, genMs } = makeSampleCsv(n);
-  metrics.genMs = genMs;
-  log(`[計測] CSV生成(JS側、参考値): ${genMs.toFixed(1)} ms`);
-
   const duckdb = await connector.getDuckDB();
 
   setupUpload(db, duckdb);
-
-  const tLoad0 = performance.now();
-  await duckdb.registerFileText('points.csv', csvText);
-  await db.exec(loadCSV('points', 'points.csv'));
-  const loadMs = performance.now() - tLoad0;
-  metrics.loadMs = loadMs;
-  metrics.memAfterLoadBytes = memSnapshot();
-  log(`[計測] DuckDB-WASM への登録: ${loadMs.toFixed(1)} ms`);
-
-  const countRows: any = await db.query(
-    Query.from('points').select({ n: count() })
-  );
-  const totalRows = Number(countRows.get(0).n);
-  log(`[1] OK: SELECT COUNT(*) FROM points -> ${totalRows} 行`);
-
-  // --- 2. 散布図 + ヒストグラムを、共有 Selection で範囲選択連動させる -----
-  log(`[2] 散布図（${markKind}）・ヒストグラムを描画し、範囲選択を連動させます…`);
-  const $brush = Selection.crossfilter();
-
-  const scatter = plot(
-    buildScatterMark(markKind, $brush),
-    intervalXY({ as: $brush }),
-    width(360),
-    height(300)
-  );
-
-  const hist = plot(
-    rectY(from('points', { filterBy: $brush }), {
-      x: bin('x'),
-      y: count(),
-      fill: 'steelblue',
-    }),
-    intervalX({ as: $brush }),
-    width(360),
-    height(300)
-  );
-
-  const firstRenderPromise = waitForFirstSvg(scatter);
-  plotsEl.appendChild(scatter);
-  plotsEl.appendChild(hist);
-
-  try {
-    const firstRenderMs = await firstRenderPromise;
-    metrics.firstRenderMs = firstRenderMs;
-    metrics.scatterDomNodes = scatter.querySelectorAll('*').length;
-    metrics.memAfterRenderBytes = memSnapshot();
-    log(`[計測] 初回の散布図描画: ${firstRenderMs.toFixed(1)} ms`);
-    log(`[計測] 散布図のDOMノード数: ${metrics.scatterDomNodes.toLocaleString()}`);
-    log('[2] OK: 散布図・ヒストグラムを描画しました（ドラッグで範囲選択を確認）');
-  } catch (e) {
-    log(`[2] ✗ 初回描画がタイムアウトしました: ${e instanceof Error ? e.message : e}`);
-    metrics.memAfterRenderBytes = memSnapshot();
-  }
-
-  // --- 3. 選択された行数を画面に表示する ----------------------------------
-  makeClient({
-    coordinator: db,
-    selection: $brush,
-    query: (filter) => Query.from('points').select({ n: count() }).where(filter),
-    queryResult: (data: any) => {
-      const selected = Number(data.get(0).n);
-      countEl.textContent = `${selected} / ${totalRows} 行`;
-      metrics.lastSelectionAppliedAt = performance.now();
-    },
-  });
-  log('[3] OK: 選択行数の表示クライアントを接続しました');
-  log('=== READY ===');
 }
 
 main().catch((err) => {
   console.error(err);
-  log(`✗ エラー: ${err instanceof Error ? err.message : String(err)}`);
+  setUploadStatus(`⚠️ 初期化に失敗しました: ${err instanceof Error ? err.message : String(err)}`, true);
 });

@@ -4,20 +4,58 @@ body {
   margin: 1.5rem;
 }
 
-#status {
-  white-space: pre-line;
-  font-size: 0.9rem;
-  margin-bottom: 1rem;
-}
-
-#count {
-  font-weight: bold;
-}
-
 #plots {
   display: flex;
   gap: 1rem;
   flex-wrap: wrap;
+}
+
+#axisControls {
+  display: flex;
+  gap: 1.5rem;
+  margin: 0.5rem 0;
+}
+
+#countLine {
+  font-weight: bold;
+}
+
+#filterExclusionNote {
+  color: #a06400;
+  font-size: 0.9rem;
+  margin: 0.5rem 0;
+}
+
+#filterPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 0.5rem 0 1rem;
+}
+
+.filter-item {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  font-size: 0.85rem;
+}
+
+.filter-item > label:first-child {
+  min-width: 6rem;
+  font-weight: bold;
+}
+
+.filter-range-value {
+  font-variant-numeric: tabular-nums;
+  color: #555;
+}
+
+.filter-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  margin-right: 0.5rem;
 }
 
 #dropzone {
