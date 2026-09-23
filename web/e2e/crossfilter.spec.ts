@@ -1,7 +1,7 @@
 // クロスフィルタの中核: 読み込み → ドラッグ選択 → 件数・統計・回帰・要約の連動。
 
 import { test, expect } from '@playwright/test';
-import { loadSample, countOf, drag, scatter, histX, waitForSelection, parseCount } from './helpers';
+import { loadSample, countOf, drag, scatter, histX, waitForSelection, parseCount, card, control } from './helpers';
 
 test.beforeEach(async ({ page }) => {
   await loadSample(page);
@@ -10,8 +10,8 @@ test.beforeEach(async ({ page }) => {
 test('サンプルを読み込むと、軸が自動で選ばれ、未選択の案内が出る', async ({ page }) => {
   expect(await countOf(page, 'populationCount')).toBe(3000);
   // 相関が最も強い2列が自動で軸になる（サンプルは厚みと強度に強い負の相関を仕込んである）
-  await expect(page.locator('#xAxisSelect')).toHaveValue('厚み');
-  await expect(page.locator('#yAxisSelect')).toHaveValue('強度');
+  await expect(control(page, 'scatter', 'x')).toHaveValue('厚み');
+  await expect(control(page, 'scatter', 'y')).toHaveValue('強度');
   await expect(page.locator('#insightCard')).toContainText('ドラッグして');
   await expect(page.locator('#selectedCount')).toHaveText('—');
   await expect(page.locator('#clearSelection')).toBeDisabled();
@@ -31,8 +31,9 @@ test('散布図をドラッグすると、件数・要約・統計・回帰が�
 
   // 回帰の n は選択件数と1件単位で一致する（Mosaic の事前集計による
   // ピクセル丸めで 847 と 848 がずれた不具合の再発防止）
-  await expect(page.locator('#regressionSummary')).toContainText('選択中');
-  const nValues = await page.locator('#regressionSummary .reg-detail').allTextContents();
+  const regression = card(page, 'scatter').locator('.chart-regression');
+  await expect(regression).toContainText('選択中');
+  const nValues = await regression.locator('.reg-detail').allTextContents();
   const selectedN = parseCount(nValues[1].match(/n = ([\d,]+)/)![1]);
   // 散布図の範囲選択は X・Y 両方の範囲条件なので、軸の列が欠測の行は
   // 選択に入らない。よって回帰の n は選択件数とちょうど一致するはず
@@ -57,7 +58,7 @@ test('ヒストグラムのドラッグでも選択でき、Esc と解除ボタ�
 test('軸を変えると選択が解除される（見えない選択が残らない）', async ({ page }) => {
   await drag(page, scatter(page), [0.55, 0.45], [0.95, 0.9]);
   await waitForSelection(page);
-  await page.selectOption('#xAxisSelect', '温度');
+  await control(page, 'scatter', 'x').selectOption('温度');
   await expect(page.locator('#selectedCount')).toHaveText('—');
   await expect(page.locator('#conditionChips')).not.toContainText('選択:');
 });
@@ -83,7 +84,7 @@ test('行データタブに選択中の行が出る', async ({ page }) => {
 test('絞り込みでカテゴリが減っても、各カテゴリの色は変わらない', async ({ page }) => {
   // 凡例の見本色を、カテゴリ名 → 色 で読む
   const legendColors = () =>
-    page.locator('.legend-wrap').evaluate((root) => {
+    card(page, 'scatter').locator('.legend-wrap').evaluate((root) => {
       const colors: Record<string, string> = {};
       root.querySelectorAll('svg').forEach((svg) => {
         const label = svg.parentElement?.textContent?.trim() ?? '';
@@ -92,7 +93,7 @@ test('絞り込みでカテゴリが減っても、各カテゴリの色は変�
       });
       return colors;
     });
-  await expect(page.locator('#colorSelect')).toHaveValue('ライン');
+  await expect(control(page, 'scatter', 'color')).toHaveValue('ライン');
   const before = await legendColors();
   expect(Object.keys(before)).toEqual(['A', 'B', 'C']);
 
@@ -110,12 +111,12 @@ test('ウィンドウの幅を変えると、選択を保ったままチャー�
   const chips = await page.locator('#conditionChips').textContent();
   const widthBefore = (await scatter(page).boundingBox())!.width;
 
-  // 置き場所が 900px 未満になると、散布図とヒストグラムは横並びから縦積みに
-  // 変わり、散布図は置き場所の幅いっぱいになる（main.ts の plotSizes）
+  // 置き場所が狭くなると、グラフのカードは2列から1列に並び替わり、
+  // 散布図はカードの幅いっぱいに描き直される（chartGrid.ts の resize）
   await page.setViewportSize({ width: 1100, height: 1100 });
-  const plotsWidth = () => page.locator('#plots').evaluate((el) => el.clientWidth);
+  const bodyWidth = () => card(page, 'scatter').locator('.chart-body').evaluate((el) => el.clientWidth);
   await expect.poll(async () => (await scatter(page).boundingBox())!.width).not.toBe(widthBefore);
-  expect(Math.abs((await scatter(page).boundingBox())!.width - (await plotsWidth()))).toBeLessThan(2);
+  await expect.poll(async () => Math.abs((await scatter(page).boundingBox())!.width - (await bodyWidth()))).toBeLessThan(2);
   const histBox = (await histX(page).boundingBox())!;
   expect(histBox.y).toBeGreaterThan((await scatter(page).boundingBox())!.y + 100);
 

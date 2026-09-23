@@ -40,7 +40,7 @@ export async function waitForDashboard(page: Page, total: number) {
   await expect(page.locator('#totalCount')).toHaveText(total.toLocaleString('en-US'), { timeout: 60_000 });
   await expect(page.locator('#populationCount')).toHaveText(/\d/);
   await expect(page.locator('#chartStatus')).toContainText(`${total.toLocaleString('en-US')} 行`);
-  await expect(page.locator('.plot-side svg').first()).toBeVisible();
+  await expect(page.locator('.chart-card .chart-body > .plot svg').first()).toBeVisible();
 }
 
 export async function loadCsv(page: Page, path: string, total: number) {
@@ -63,10 +63,18 @@ export async function drag(page: Page, target: Locator, from: [number, number], 
   await page.mouse.up();
 }
 
-// チャート本体の svg。凡例の見本色（小さな svg）や入れ子の svg を拾わないよう、
-// 直下の子要素に限る
-export const scatter = (page: Page) => page.locator('.plot-main > :last-child > svg').first();
-export const histX = (page: Page) => page.locator('.plot-side > :first-child > svg').first();
+/** 指定した種類のグラフのカード（n 枚目、0 始まり）。 */
+export const card = (page: Page, type: string, n = 0) => page.locator(`.chart-card[data-type="${type}"]`).nth(n);
+
+// グラフ本体の svg。凡例の見本色（小さな svg）や入れ子の svg を拾わないよう、
+// プロット要素の直下に限る
+export const plotSvg = (page: Page, type: string, n = 0) => card(page, type, n).locator('.chart-body > .plot svg').first();
+export const scatter = (page: Page) => plotSvg(page, 'scatter');
+// 初期表示では散布図の X 軸の列のヒストグラムが最初のヒストグラム
+export const histX = (page: Page) => plotSvg(page, 'histogram');
+
+/** カードの設定（X・Y・種類・色など）の select。 */
+export const control = (page: Page, type: string, role: string, n = 0) => card(page, type, n).locator(`[data-role="${role}"]`);
 
 /** 統計表の、指定した列の行。 */
 export const statsRow = (page: Page, column: string) =>

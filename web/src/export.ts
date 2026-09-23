@@ -67,13 +67,15 @@ export function composeFigure(plotsEl: HTMLElement, caption: FigureCaption): { s
   const captionHeight = TITLE_SIZE + LINE_GAP + caption.lines.length * (LINE_SIZE + LINE_GAP) + LINE_GAP;
   const top = PADDING + captionHeight;
 
-  // 凡例も画面上と同じ位置に描き直す
-  const legendEl = plotsEl.querySelector<HTMLElement>('.legend-wrap');
-  const legendRect = legendEl?.getBoundingClientRect();
-  const legend =
-    legendEl && legendRect
-      ? legendSvg(legendEl, PADDING + (legendRect.left - base.left), top + (legendRect.top - base.top) + 2)
-      : { svg: '' };
+  // 凡例とグラフの見出しも、画面上と同じ位置に描き直す（HTML なので svg には入っていない）
+  const legends = [...plotsEl.querySelectorAll<HTMLElement>('.legend-wrap')].map((el) => {
+    const r = el.getBoundingClientRect();
+    return legendSvg(el, PADDING + (r.left - base.left), top + (r.top - base.top) + 2).svg;
+  });
+  const titles = [...plotsEl.querySelectorAll<HTMLElement>('[data-chart-title]')].map((el) => {
+    const r = el.getBoundingClientRect();
+    return `<text x="${PADDING + (r.left - base.left)}" y="${top + (r.top - base.top) + 12}" font-size="12" font-weight="700" font-family="${FONT}" fill="#1c2330">${escapeHtml(el.textContent ?? '')}</text>`;
+  });
 
   const plotSvgs = [...plotsEl.querySelectorAll<SVGSVGElement>('svg')].filter((s) => {
     // svg の中の svg（入れ子）と、凡例の見本色は除く
@@ -104,7 +106,7 @@ export function composeFigure(plotsEl: HTMLElement, caption: FigureCaption): { s
 
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
 <rect width="100%" height="100%" fill="#ffffff"/>
-${title}${lines}${legend.svg}
+${title}${lines}${titles.join('')}${legends.join('')}
 ${pieces.join('\n')}
 </svg>`;
   return { svg, width, height };

@@ -29,7 +29,8 @@ export function connectRowsClient(
   $selected: Selection,
   container: HTMLElement
 ) {
-  makeClient({
+  // 機械学習で列が増えたときに繋ぎ直せるよう、作ったクライアントを返す
+  return makeClient({
     coordinator: db,
     // 事前集計（preaggregation）を使わせない。Mosaic の事前集計はブラシの
     // 範囲を画面のピクセル単位に丸めて集計するため、描画には十分でも

@@ -997,27 +997,109 @@ body.dragging .welcome {
   position: relative;
 }
 
-.plots {
+/* グラフのカードを並べる。幅が足りなければ1列に落ちる */
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 460px), 1fr));
+  gap: 1rem;
+  align-items: start;
+}
+
+.chart-card {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.65rem 0.8rem 0.75rem;
+  background: var(--surface);
+}
+
+.chart-card:hover {
+  border-color: var(--border-strong);
+}
+
+.chart-head {
   display: flex;
-  gap: 1.5rem;
-  flex-wrap: wrap;
   align-items: flex-start;
-}
-
-.plot-main {
-  display: flex;
-  flex-direction: column;
-  gap: 0.3rem;
-}
-
-.plot-side {
-  display: flex;
-  flex-direction: column;
   gap: 0.5rem;
 }
 
-.plots svg {
+.chart-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.75rem;
+  flex: 1;
+  min-width: 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.chart-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.chart-controls select {
+  max-width: 11rem;
+  padding: 0.18rem 0.3rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.8rem;
+}
+
+.chart-controls .inline-check {
+  margin-top: 0;
+  font-size: 0.78rem;
+}
+
+.icon-button {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: var(--muted);
+  font-size: 1.05rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.icon-button:hover {
+  border-color: var(--border);
+  background: var(--surface-2);
+  color: var(--danger);
+}
+
+.chart-title {
+  margin-top: 0.45rem;
+  font-size: 0.84rem;
+  font-weight: 700;
+}
+
+.chart-hint {
+  margin: 0.05rem 0 0.3rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.chart-body svg {
   overflow: visible;
+}
+
+.chart-empty {
+  padding: 2rem 1rem;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.primary-button.small {
+  padding: 0.22rem 0.7rem;
+  font-size: 0.78rem;
 }
 
 /* 最初の一回だけ出す「ここをドラッグ」の吹き出し */

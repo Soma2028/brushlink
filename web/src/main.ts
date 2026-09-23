@@ -29,13 +29,10 @@ import {
 import type { LoadedTable } from './upload';
 import { classifyColumns, buildFilterPanel, newFilterSelection } from './filters';
 import type { ClassifiedColumns, FilterPanel, MissingIncludedEntry } from './filters';
-import {
-  pickBestAxisPair,
-  buildScatterPlot,
-  buildHistogram,
-  buildColorLegend,
-  DOT_TO_RASTER_THRESHOLD,
-} from './charts';
+import { pickBestAxisPair, pickBestGroup, DOT_TO_RASTER_THRESHOLD } from './charts';
+import { ChartGrid } from './chartGrid';
+import { initialLayout, suggestNextChart, newChart, xOptions, CHART_LABELS } from './chartTypes';
+import type { ColumnKinds } from './chartTypes';
 import { connectStatsClients, connectLiveCount, renderStatsTable, compareNumeric, formatStat } from './stats';
 import type { StatsSnapshot } from './stats';
 import {
@@ -46,8 +43,6 @@ import {
   categoryLabels,
 } from './categories';
 import type { CategoryCounts } from './categories';
-import { connectRegressionClients, renderRegression } from './regression';
-import type { RegressionResult } from './regression';
 import { renderInsights } from './insights';
 import { connectRowsClient } from './rows';
 import { createMLPanel } from './mlPanel';
@@ -96,19 +91,9 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         </details>
       </section>
 
-      <section class="panel" id="view-section" hidden>
-        <h2><span class="step">2</span>表示</h2>
-        <div class="field-grid">
-          <label for="xAxisSelect">X軸</label><select id="xAxisSelect"></select>
-          <label for="yAxisSelect">Y軸</label><select id="yAxisSelect"></select>
-          <label for="colorSelect">色分け</label><select id="colorSelect"></select>
-        </div>
-        <label class="inline-check"><input type="checkbox" id="regressionToggle" checked> 回帰直線を表示</label>
-      </section>
-
       <section class="panel" id="filter-section" hidden>
         <div class="panel-head">
-          <h2><span class="step">3</span>絞り込み</h2>
+          <h2><span class="step">2</span>絞り込み</h2>
           <button type="button" id="filterReset" class="link-button">すべてリセット</button>
         </div>
         <p class="hint">分析の対象（母集団）を絞ります。チャート上の選択は、絞った中で行われます。</p>
@@ -166,22 +151,26 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
 
       <section id="chart-card" class="card" hidden>
         <div class="card-head">
-          <h2>チャート</h2>
+          <h2>グラフ</h2>
           <div class="card-actions">
             <span id="chartStatus" class="status muted"></span>
+            <button type="button" id="addChart" class="primary-button small">＋ グラフを追加</button>
             <button type="button" id="exportPng" class="ghost-button small">PNG で保存</button>
             <button type="button" id="exportSvg" class="ghost-button small">SVG で保存</button>
           </div>
         </div>
-        <p class="hint" id="chartHint"></p>
+        <p class="hint">
+          数値の軸はドラッグで範囲を、カテゴリの軸はクリックで選択します。どのグラフで選んでも、
+          他のグラフと数値が連動します。灰色は選択外、色付きが選択中。各グラフの X・Y を変えると、
+          その列で描けるグラフだけが「種類」に並びます。
+        </p>
         <div class="plots-wrap">
           <div id="coachMark" class="coach-mark" hidden>
             <span class="coach-hand" aria-hidden="true">👆</span>
-            <span>ここをドラッグして範囲を選択</span>
+            <span>グラフの上をドラッグ・クリックして選択</span>
           </div>
-          <div id="plots" class="plots"></div>
+          <div id="plots" class="chart-grid"></div>
         </div>
-        <div id="regressionSummary" class="regression"></div>
       </section>
 
       <section id="detail-card" class="card" hidden>
@@ -217,7 +206,8 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       <h3>基本の流れ</h3>
       <ol>
         <li><strong>データを読み込む</strong> — CSV / Excel をドロップ。見出し行は自動で判定し、外れていたら「ヘッダ行と列の型を確認・変更」から選び直せます。</li>
-        <li><strong>チャートをドラッグ</strong> — 散布図は四角く、ヒストグラムは横に囲みます。何もない所をクリックするか Esc キーで解除。</li>
+        <li><strong>グラフで選ぶ</strong> — 散布図は四角く、ヒストグラム・折れ線は横にドラッグ。棒グラフ・誤差棒はカテゴリをクリック（Shift で複数）。何もない所をクリックするか Esc キーで解除。</li>
+        <li><strong>グラフを増やす</strong> — 「＋ グラフを追加」で並べられます。各グラフの X・Y を選ぶと、その組み合わせで描けるグラフだけが「種類」に出ます。</li>
         <li><strong>違いを読む</strong> — 上の要約、下の「統計量」「カテゴリ構成」、機械学習のタブで、選んだ行と残りの行を比べます。</li>
         <li><strong>図を保存</strong> — 「PNG で保存」で、条件の注記つきの図を書き出せます。</li>
       </ol>
@@ -251,11 +241,6 @@ const previewDetailsEl = $<HTMLDetailsElement>('#previewDetails');
 const previewTableEl = $<HTMLTableElement>('#previewTable');
 const uploadResultEl = $<HTMLDivElement>('#uploadResult');
 
-const viewSectionEl = $<HTMLElement>('#view-section');
-const xAxisSelectEl = $<HTMLSelectElement>('#xAxisSelect');
-const yAxisSelectEl = $<HTMLSelectElement>('#yAxisSelect');
-const colorSelectEl = $<HTMLSelectElement>('#colorSelect');
-const regressionToggleEl = $<HTMLInputElement>('#regressionToggle');
 const filterSectionEl = $<HTMLElement>('#filter-section');
 const filterResetEl = $<HTMLButtonElement>('#filterReset');
 const filterMissingNoteEl = $<HTMLDivElement>('#filterMissingNote');
@@ -277,10 +262,9 @@ const conditionChipsEl = $<HTMLDivElement>('#conditionChips');
 const insightCardEl = $<HTMLElement>('#insightCard');
 const chartCardEl = $<HTMLElement>('#chart-card');
 const chartStatusEl = $<HTMLSpanElement>('#chartStatus');
-const chartHintEl = $<HTMLParagraphElement>('#chartHint');
 const coachMarkEl = $<HTMLDivElement>('#coachMark');
 const plotsEl = $<HTMLDivElement>('#plots');
-const regressionSummaryEl = $<HTMLDivElement>('#regressionSummary');
+const addChartEl = $<HTMLButtonElement>('#addChart');
 const exportPngEl = $<HTMLButtonElement>('#exportPng');
 const exportSvgEl = $<HTMLButtonElement>('#exportSvg');
 const detailCardEl = $<HTMLElement>('#detail-card');
@@ -393,81 +377,22 @@ function renderMissingIncludedNote(entries: MissingIncludedEntry[]) {
   filterMissingNoteEl.textContent = `欠測を含めている列: ${detail}`;
 }
 
-function populateSelect(
-  select: HTMLSelectElement,
-  options: { value: string; label: string }[],
-  selected: string
-) {
-  select.innerHTML = options
-    .map(
-      (o) =>
-        `<option value="${escapeHtml(o.value)}" ${o.value === selected ? 'selected' : ''}>${escapeHtml(o.label)}</option>`
-    )
-    .join('');
-}
-
 function percent(part: number, whole: number): string {
   if (whole <= 0) return '—';
   const p = (part / whole) * 100;
   return `${p >= 10 || p === 0 ? p.toFixed(0) : p.toFixed(1)}%`;
 }
 
-interface PlotSizes {
-  scatter: { width: number; height: number };
-  hist: { width: number; height: number };
-}
-
-/**
- * プロットの大きさを、置き場所の幅から決める。固定幅だと狭い画面で
- * 横スクロールが出て、広い画面では余白ばかりになるため。
- * 幅 900px 以上では散布図とヒストグラムを横に並べ、それ未満では縦に積む。
- */
-function plotSizes(): PlotSizes {
-  const available = Math.max(plotsEl.clientWidth, 320);
-  const scatterWidth = available >= 900 ? Math.floor(available * 0.58) : available;
-  const histWidth = available >= 900 ? available - scatterWidth - 24 : available;
-  return {
-    scatter: { width: scatterWidth, height: Math.round(Math.min(scatterWidth * 0.75, 460)) },
-    hist: { width: histWidth, height: 190 },
-  };
-}
-
-// 描画中のプロット（vgplot の要素。value に Plot オブジェクトを持つ）
-type PlotElement = HTMLElement & { value?: { setAttribute(name: string, value: unknown): boolean; render(): Promise<void> } };
-let currentPlots: { scatter: PlotElement; hists: PlotElement[] } | null = null;
-let lastLayoutWidth = 0;
-
-/**
- * ウィンドウの大きさが変わったら、チャートを作り直さずに大きさだけ変えて
- * 描き直す。作り直すと選択（ブラシ）が消えてしまうが、Plot の幅を変えて
- * render() するだけなら、手元のデータで描き直され、ブラシも範囲（データ値）
- * から新しい目盛りの上に描き直される。クエリも投げ直さない。
- * raster は画面の画素に合わせた集計なので、次に集計し直すまで画像が
- * 引き伸ばされるが、ドラッグなどで次の更新が来れば正しい解像度に戻る。
- */
-function resizePlots() {
-  if (!currentPlots) return;
-  const width = plotsEl.clientWidth;
-  // スクロールバーの出入り程度の小さな変化では描き直さない
-  if (Math.abs(width - lastLayoutWidth) < 16) return;
-  lastLayoutWidth = width;
-  const sizes = plotSizes();
-  const apply = (el: PlotElement, size: { width: number; height: number }) => {
-    const plot = el.value;
-    if (!plot) return;
-    const changedW = plot.setAttribute('width', size.width);
-    const changedH = plot.setAttribute('height', size.height);
-    if (changedW || changedH) plot.render();
-  };
-  apply(currentPlots.scatter, sizes.scatter);
-  currentPlots.hists.forEach((h) => apply(h, sizes.hist));
-}
+// 表示中のグラフの並び（ファイルを読み込むたびに作り直す）
+let grid: ChartGrid | null = null;
 
 let resizeTimer: number | undefined;
 new ResizeObserver(() => {
-  // リサイズ中は連続して呼ばれるので、手が止まってから1回だけ描き直す
+  // ウィンドウの大きさが変わったら、グラフを作り直さずに幅だけ変えて描き直す
+  // （作り直すと選択が消えるため。chartGrid.ts の resize）。リサイズ中は
+  // 連続して呼ばれるので、手が止まってから1回だけ描き直す
   window.clearTimeout(resizeTimer);
-  resizeTimer = window.setTimeout(resizePlots, 200);
+  resizeTimer = window.setTimeout(() => grid?.resize(), 200);
 }).observe(plotsEl);
 
 // ---------------------------------------------------------------------------
@@ -493,14 +418,15 @@ function fieldName(field: unknown): string | null {
 }
 
 /**
- * チャートで範囲を選ぶのに使った列と、その範囲の説明文。
- * 範囲の値は interactor（intervalX / intervalXY）が節に持たせる value から読む。
+ * チャートで選ぶのに使った列と、その選択の説明文。
+ * 範囲の値は interactor（intervalX / intervalXY）が節に持たせる value から、
+ * クリックで選んだカテゴリは toggle の節の value（選んだ値の組の配列）から読む。
  */
 function describeBrush($brush: Selection): { cols: Set<string>; texts: string[] } {
   const cols = new Set<string>();
   const texts: string[] = [];
   for (const clause of brushClauses($brush)) {
-    const src = clause.source as { field?: unknown; xfield?: unknown; yfield?: unknown };
+    const src = clause.source as { field?: unknown; xfield?: unknown; yfield?: unknown; fields?: unknown[] };
     const value = clause.value as unknown;
     const range = (name: string | null, v: unknown) => {
       if (!name) return;
@@ -509,7 +435,14 @@ function describeBrush($brush: Selection): { cols: Set<string>; texts: string[] 
         texts.push(`${name} ${formatStat(v[0])}〜${formatStat(v[1] as number)}`);
       }
     };
-    if (src.xfield !== undefined || src.yfield !== undefined) {
+    if (Array.isArray(src.fields)) {
+      // クリック選択（toggle）: value は [[値], [値], ...]
+      const name = fieldName(src.fields[0]);
+      if (!name) continue;
+      cols.add(name);
+      const picked = Array.isArray(value) ? value.map((p) => String(Array.isArray(p) ? p[0] : p)) : [];
+      if (picked.length) texts.push(`${name} = ${picked.join('・')}`);
+    } else if (src.xfield !== undefined || src.yfield !== undefined) {
       const [xr, yr] = Array.isArray(value) ? value : [];
       range(fieldName(src.xfield), xr);
       range(fieldName(src.yfield), yr);
@@ -524,9 +457,6 @@ function describeBrush($brush: Selection): { cols: Set<string>; texts: string[] 
 // データ読み込み後の組み立て
 // ---------------------------------------------------------------------------
 
-// 散布図の名前に付ける連番。凡例は名前で散布図を引くため、別ファイルを
-// 読み込んだ後も含めて一意にする（重複すると vgplot が古い図を上書きする）
-let plotSerial = 0;
 // 使い方の吹き出し（コーチマーク）は、最初に一度選択できたら二度と出さない
 let hasEverSelected = false;
 
@@ -544,17 +474,17 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
   welcomeEl.hidden = true;
   chartCardEl.hidden = false;
   setChartStatus('列を調べています…', false);
-  for (const el of [summaryBarEl, insightCardEl, detailCardEl, viewSectionEl, filterSectionEl]) el.hidden = true;
+  for (const el of [summaryBarEl, insightCardEl, detailCardEl, filterSectionEl]) el.hidden = true;
   filterMissingNoteEl.textContent = '';
   filterExclusionNoteEl.textContent = '';
   filterPanelEl.innerHTML = '';
+  grid?.clear();
+  grid = null;
   plotsEl.innerHTML = '';
-  regressionSummaryEl.innerHTML = '';
   statsTableEl.innerHTML = '';
   categoryPanelEl.innerHTML = '';
   rowsPanelEl.innerHTML = '';
   mlPanel = null;
-  currentPlots = null;
 
   db.clear(); // 古いチャート・集計クライアントを切断する（既定で clients・cache とも true）
 
@@ -581,13 +511,18 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
   const $populationSettled = settledMirror($filter);
   const $selectedSettled = settledMirror($selected);
 
-  // 機械学習で列を追加すると増える、軸・色分け・データ表の候補
-  const axisCols = [...cols.numericCols];
-  const colorCols = [...cols.catCols];
+  // グラフの X・Y・色に選べる列。機械学習で列を書き戻すと増える
+  const kinds: ColumnKinds = {
+    numeric: [...cols.numericCols],
+    category: [...cols.catCols],
+    temporal: [...cols.temporalCols],
+    order: [...cols.orderCols],
+  };
   const rowColumns = table.columns.map((c) => c.name);
   let filterDescriptions: string[] = [];
-  // 色分けに使いうる列の全カテゴリ（絞り込み前）。色の割り当てを固定するため
-  // （charts.ts の colorValues 参照）。機械学習で列を書き戻したら捨てて取り直す
+  // カテゴリ列の全カテゴリ（絞り込み前）。散布図の色、棒グラフ・誤差棒の横軸の
+  // 並び、カテゴリ構成タブの色を、絞り込みに左右されず固定するため。
+  // 機械学習で列を書き戻したら捨てて取り直す
   const categoryValues = new Map<string, unknown[]>();
   async function valuesFor(column: string): Promise<unknown[]> {
     if (!categoryValues.has(column)) {
@@ -604,8 +539,6 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
     popStats: StatsSnapshot | null;
     selCats: CategoryCounts | null;
     popCats: CategoryCounts | null;
-    selReg: RegressionResult | null;
-    popReg: RegressionResult | null;
     axisNote: string | null;
     liveSelected: number | null; // ドラッグ中も即時に更新する選択件数
   } = {
@@ -613,11 +546,11 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
     popStats: null,
     selCats: null,
     popCats: null,
-    selReg: null,
-    popReg: null,
     axisNote: null,
     liveSelected: null,
   };
+
+  const hasSelection = () => brushClauses($brush).length > 0;
 
   let renderQueued = false;
   // 集計クライアントは別々に結果を返すので、1フレームにまとめて描き直す
@@ -637,17 +570,17 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
   function renderCounts() {
     const { popStats, liveSelected } = state;
     if (!popStats || liveSelected === null) return;
-    const hasSelection = brushClauses($brush).length > 0;
+    const selecting = hasSelection();
     populationCountEl.textContent = popStats.rows.toLocaleString();
     populationRateEl.textContent =
       popStats.rows === table.rowCount ? '絞り込みなし' : `全体の ${percent(popStats.rows, table.rowCount)}`;
     populationBarEl.style.width = `${(popStats.rows / table.rowCount) * 100}%`;
-    selectedCountEl.textContent = hasSelection ? liveSelected.toLocaleString() : '—';
-    selectedRateEl.textContent = hasSelection ? `母集団の ${percent(liveSelected, popStats.rows)}` : 'ドラッグで選択';
-    selectedBarEl.style.width = hasSelection ? `${(liveSelected / table.rowCount) * 100}%` : '0';
-    summaryBarEl.classList.toggle('has-selection', hasSelection);
-    clearSelectionEl.disabled = !hasSelection;
-    if (hasSelection) {
+    selectedCountEl.textContent = selecting ? liveSelected.toLocaleString() : '—';
+    selectedRateEl.textContent = selecting ? `母集団の ${percent(liveSelected, popStats.rows)}` : 'グラフで選択';
+    selectedBarEl.style.width = selecting ? `${(liveSelected / table.rowCount) * 100}%` : '0';
+    summaryBarEl.classList.toggle('has-selection', selecting);
+    clearSelectionEl.disabled = !selecting;
+    if (selecting) {
       hasEverSelected = true;
       coachMarkEl.hidden = true;
     }
@@ -657,21 +590,21 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
     const { selStats, popStats } = state;
     if (!selStats || !popStats) return;
     const brush = describeBrush($brush);
-    const hasSelection = brushClauses($brush).length > 0;
+    const selecting = hasSelection();
     renderCounts();
 
-    // 条件のチップ（選択範囲・絞り込み）
+    // 条件のチップ（選択・絞り込み）
     conditionChipsEl.innerHTML = [
-      ...brush.texts.map((t) => `<span class="chip chip-brush" title="チャートで選んだ範囲">選択: ${escapeHtml(t)}</span>`),
+      ...brush.texts.map((t) => `<span class="chip chip-brush" title="グラフで選んだ範囲・カテゴリ">選択: ${escapeHtml(t)}</span>`),
       ...filterDescriptions.map((t) => `<span class="chip chip-filter" title="絞り込み条件">絞り込み: ${escapeHtml(t)}</span>`),
     ].join('');
 
     // 文章要約
-    const numericCmp = hasSelection ? compareNumeric(cols.numericCols, selStats, popStats) : [];
+    const numericCmp = selecting ? compareNumeric(cols.numericCols, selStats, popStats) : [];
     const catCmp =
-      hasSelection && state.selCats && state.popCats ? compareCategories(cols.catCols, state.selCats, state.popCats) : [];
+      selecting && state.selCats && state.popCats ? compareCategories(cols.catCols, state.selCats, state.popCats) : [];
     renderInsights(insightCardEl, {
-      hasSelection,
+      hasSelection: selecting,
       selectedCount: selStats.rows,
       populationCount: popStats.rows,
       numeric: numericCmp,
@@ -681,33 +614,31 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
     });
 
     // 統計量
-    statsScopeEl.innerHTML = hasSelection
+    statsScopeEl.innerHTML = selecting
       ? `選択中の <strong>${selStats.rows.toLocaleString()}</strong> 件の統計量と、選択外（母集団の残り ${(popStats.rows - selStats.rows).toLocaleString()} 件）との比較。`
-      : `母集団 <strong>${popStats.rows.toLocaleString()}</strong> 件の統計量。チャートで範囲を選ぶと、選んだ行と残りの行の比較（効果量・p 値）が加わります。`;
+      : `母集団 <strong>${popStats.rows.toLocaleString()}</strong> 件の統計量。グラフで選ぶと、選んだ行と残りの行の比較（効果量・p 値）が加わります。`;
     if (cols.numericCols.length > 0) {
-      renderStatsTable(statsTableEl, cols.numericCols, selStats, popStats, brush.cols, hasSelection);
+      renderStatsTable(statsTableEl, cols.numericCols, selStats, popStats, brush.cols, selecting);
     } else {
       statsTableEl.innerHTML = '<p class="muted">数値列がありません。</p>';
     }
 
     // カテゴリ構成
     if (state.selCats && state.popCats) {
-      renderCategoryComparison(categoryPanelEl, cols.catCols, state.selCats, state.popCats, hasSelection, categoryOrders());
+      renderCategoryComparison(categoryPanelEl, cols.catCols, state.selCats, state.popCats, selecting, categoryOrders());
     } else if (cols.catCols.length === 0) {
       categoryPanelEl.innerHTML = '<p class="muted">カテゴリ列がありません（数値以外の列で、種類が20以下のもの）。</p>';
     }
 
-    // 回帰
-    if (state.selReg && state.popReg && regressionToggleEl.checked && !plotsEl.hidden) {
-      renderRegression(regressionSummaryEl, xAxisSelectEl.value, yAxisSelectEl.value, state.selReg, state.popReg, hasSelection);
-    } else {
-      regressionSummaryEl.innerHTML = '';
-    }
-
+    // 散布図ごとの回帰（「選択中」の行を出すかどうかが選択の有無で変わる）
+    grid?.refreshRegression();
     mlPanel?.scopeChanged();
   }
 
-  function connectAnalysisClients(x: string | null, y: string | null) {
+  // 集計系のクライアント（件数・統計量・カテゴリ構成・データ表）。グラフとは
+  // 独立しているので、グラフの追加・削除では繋ぎ直さない
+  let rowsClient: unknown = null;
+  function connectAnalysisClients() {
     connectLiveCount(db, table.tableName, $selected, (n) => {
       state.liveSelected = n;
       renderCounts();
@@ -722,14 +653,11 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
       state.popCats = pop;
       scheduleRender();
     });
-    if (x && y) {
-      connectRegressionClients(db, table.tableName, x, y, $populationSettled, $selectedSettled, (sel, pop) => {
-        state.selReg = sel;
-        state.popReg = pop;
-        scheduleRender();
-      });
-    }
-    connectRowsClient(db, table.tableName, rowColumns, $selectedSettled, rowsPanelEl);
+    connectRows();
+  }
+  function connectRows() {
+    if (rowsClient) db.disconnect(rowsClient as any);
+    rowsClient = connectRowsClient(db, table.tableName, rowColumns, $selectedSettled, rowsPanelEl);
   }
 
   try {
@@ -764,12 +692,35 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
   // ---- 選択の解除 ----
   function clearSelection() {
     const clauses = brushClauses($brush);
-    if (clauses.length > 0) $brush.reset(clauses);
+    if (clauses.length === 0) return;
+    for (const cl of clauses) {
+      // クリック選択（toggle）は reset を持たず、選んだ値を内部に覚えている。
+      // 残ると次のクリックが「解除」と解釈されるので忘れさせる
+      const src = cl.source as { value?: unknown; fields?: unknown };
+      if ('fields' in src) src.value = null;
+    }
+    $brush.reset(clauses);
   }
   clearSelectionEl.onclick = clearSelection;
   document.onkeydown = (e) => {
     if (e.key === 'Escape' && !helpDialogEl.open) clearSelection();
   };
+
+  // ---- グラフの並び ----
+  const chartGrid = new ChartGrid(plotsEl, {
+    db,
+    tableName: table.tableName,
+    rowCount: table.rowCount,
+    population: $filter,
+    brush: $brush,
+    selected: $selectedSettled,
+    selectedLive: $selected,
+    populationSettled: $populationSettled,
+    getKinds: () => kinds,
+    categoryValues: valuesFor,
+    hasSelection,
+  });
+  grid = chartGrid;
 
   // ---- 機械学習パネル ----
   mlPanel = createMLPanel({
@@ -785,148 +736,97 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
     getScope: () => ({
       selectedSql: predicateSql($selected.predicate(null)),
       populationSql: predicateSql($filter.predicate(null)),
-      hasSelection: brushClauses($brush).length > 0,
+      hasSelection: hasSelection(),
       selectedCount: state.selStats?.rows ?? 0,
       populationCount: state.popStats?.rows ?? 0,
       brushedCols: describeBrush($brush).cols,
     }),
     onColumnsAdded: async (added: AddedColumns) => {
-      axisCols.push(...added.numeric.filter((c) => !axisCols.includes(c)));
-      colorCols.push(...added.categorical.filter((c) => !colorCols.includes(c)));
+      for (const c of added.numeric) if (!kinds.numeric.includes(c)) kinds.numeric.push(c);
+      for (const c of added.categorical) if (!kinds.category.includes(c)) kinds.category.push(c);
       rowColumns.push(...[...added.numeric, ...added.categorical].filter((c) => !rowColumns.includes(c)));
       for (const c of added.categorical) categoryValues.delete(c);
-      const [x, y] = added.axes ?? [xAxisSelectEl.value, yAxisSelectEl.value];
-      populateAxisSelects(x, y, added.color ?? colorSelectEl.value);
       // 列の値を書き換えたので、Mosaic の事前集計（crossfilter 高速化用の
-      // 集計済みテーブル）を捨てる。残すと古い値の集計が使われてしまう
+      // 集計済みテーブル）とクエリのキャッシュを捨てる。残すと古い値が使われる
       await db.preaggregator.dropSchema();
-      await rebuildCharts();
+      db.clear({ clients: false, cache: true });
+      connectRows();
+      // 結果を最初の散布図に反映する（無ければ散布図を1枚足す）
+      const scatter = chartGrid.configs.find((c) => c.type === 'scatter');
+      const patch = {
+        ...(added.axes ? { x: added.axes[0], y: added.axes[1] } : {}),
+        ...(added.color ? { color: added.color } : {}),
+      };
+      if (scatter) {
+        await chartGrid.update(scatter.id, patch);
+      } else if (added.axes) {
+        await chartGrid.add(newChart({ type: 'scatter', x: added.axes[0], y: added.axes[1], color: added.color ?? null }));
+      }
+      // 他のグラフの選択肢（X・Y・色の列）にも新しい列を出す
+      await chartGrid.rebuildAll();
     },
   });
   selectTab(activeTab);
 
-  if (cols.numericCols.length < 2) {
-    plotsEl.hidden = true;
-    coachMarkEl.hidden = true;
-    exportPngEl.hidden = exportSvgEl.hidden = true;
-    chartHintEl.textContent = '';
-    connectAnalysisClients(null, null);
-    setChartStatus('散布図を描くには数値列が2つ以上必要です（絞り込みと統計量は利用できます）。', false);
-    return;
-  }
-  plotsEl.hidden = false;
-  exportPngEl.hidden = exportSvgEl.hidden = false;
+  connectAnalysisClients();
 
-  let pair;
+  // ---- 初期のグラフを列の型から自動で決める ----
+  let bestPair: { x: string; y: string } | null = null;
+  let bestGroup: { category: string; numeric: string } | null = null;
+  let autoPickError: string | null = null;
   try {
-    pair = await pickBestAxisPair(db, table.tableName, cols.numericCols);
+    if (cols.numericCols.length >= 2) {
+      const pair = await pickBestAxisPair(db, table.tableName, cols.numericCols);
+      bestPair = pair;
+      if (pair.r !== null) {
+        state.axisNote = `散布図の軸は、相関がいちばん強い「${escapeHtml(pair.x)}」と「${escapeHtml(pair.y)}」（相関係数 r = ${pair.r.toFixed(2)}）を自動で選びました。`;
+      }
+    }
+    if (cols.catCols.length > 0 && cols.numericCols.length > 0) {
+      bestGroup = await pickBestGroup(db, table.tableName, cols.catCols, cols.numericCols);
+      if (bestGroup) {
+        state.axisNote =
+          (state.axisNote ?? '') +
+          `誤差棒は、グループ間の差がいちばん大きい「${escapeHtml(bestGroup.category)}」×「${escapeHtml(bestGroup.numeric)}」です。`;
+      }
+    }
   } catch (e) {
-    setChartStatus(`⚠️ 軸の自動選択に失敗しました: ${e instanceof Error ? e.message : String(e)}`, true);
-    return;
+    // 自動選択に失敗しても、分かる範囲のグラフは並べて続ける（失敗は状態表示に残す）
+    autoPickError = `⚠️ グラフの自動選択に失敗しました: ${e instanceof Error ? e.message : String(e)}`;
   }
-  state.axisNote =
-    pair.r !== null
-      ? `散布図の軸は、相関がいちばん強い「${escapeHtml(pair.x)}」と「${escapeHtml(pair.y)}」（相関係数 r = ${pair.r.toFixed(2)}）を自動で選びました。左の「表示」で変えられます。`
-      : null;
+  if (state.axisNote) state.axisNote += ' 各グラフの X・Y で変えられます。';
 
   const useRaster = table.rowCount >= DOT_TO_RASTER_THRESHOLD;
-
-  function populateAxisSelects(x: string, y: string, color: string) {
-    const numericOptions = axisCols.map((c) => ({ value: c, label: c }));
-    populateSelect(xAxisSelectEl, numericOptions, x);
-    populateSelect(yAxisSelectEl, numericOptions, y);
-    // raster 描画のときは色分けできないため、セレクタごと無効にして理由を出す
-    populateSelect(colorSelectEl, [{ value: '', label: '（なし）' }, ...colorCols.map((c) => ({ value: c, label: c }))], useRaster ? '' : color);
-    colorSelectEl.disabled = useRaster || colorCols.length === 0;
-    colorSelectEl.title = useRaster
-      ? `行数が ${DOT_TO_RASTER_THRESHOLD.toLocaleString()} 件以上のため密度表示（raster）になり、色分けできません`
-      : '';
-  }
-  // 色分けの初期値は最初のカテゴリ列（自動で組み立てる）。「なし」も選べる。
-  populateAxisSelects(pair.x, pair.y, cols.catCols[0] ?? '');
-  viewSectionEl.hidden = false;
-
-  async function rebuildCharts() {
-    const colorCol = colorSelectEl.value || null;
-    const colorValues = colorCol && !useRaster ? await valuesFor(colorCol) : null;
-
-    db.clear(); // 直前のチャート・集計クライアントを切断する
-    // 軸が変わると古いブラシの範囲は新しいチャート上に描けないので、選択も解除する。
-    // 残すと「見えない選択」が統計量に効き続けてしまう
-    clearSelection();
-    plotsEl.innerHTML = '';
-    state.selReg = state.popReg = null;
-
-    const xCol = xAxisSelectEl.value;
-    const yCol = yAxisSelectEl.value;
-    const sizes = plotSizes();
-    // 凡例は名前で散布図を引くため、作り直すたびに別名にして古い図を掴まないようにする
-    const plotName = `scatter-${++plotSerial}`;
-
-    const scatter = buildScatterPlot({
-      tableName: table.tableName,
-      x: xCol,
-      y: yCol,
-      colorCol,
-      colorValues,
-      rowCount: table.rowCount,
-      population: $filter,
-      brush: $brush,
-      selected: $selectedSettled,
-      showRegression: regressionToggleEl.checked,
-      plotName,
-      width: sizes.scatter.width,
-      height: sizes.scatter.height,
-    });
-    const histX = buildHistogram(table.tableName, xCol, $filter, $brush, sizes.hist);
-    const histY = buildHistogram(table.tableName, yCol, $filter, $brush, sizes.hist);
-    currentPlots = { scatter, hists: [histX, histY] };
-    lastLayoutWidth = plotsEl.clientWidth;
-
-    const scatterWrap = document.createElement('div');
-    scatterWrap.className = 'plot-main';
-    if (colorCol) {
-      const legend = document.createElement('div');
-      legend.className = 'legend-wrap';
-      legend.appendChild(buildColorLegend(plotName));
-      scatterWrap.appendChild(legend);
-    }
-    scatterWrap.appendChild(scatter);
-    const side = document.createElement('div');
-    side.className = 'plot-side';
-    side.append(histX, histY);
-    plotsEl.append(scatterWrap, side);
-
-    connectAnalysisClients(xCol, yCol);
-
-    // raster の散布図は1層だけ（charts.ts 参照）なので、灰色の背景は出ない。
-    // 説明文と見た目が食い違わないよう、そのときだけ一言添える
-    chartHintEl.textContent =
-      '散布図は四角く、ヒストグラムは横にドラッグして範囲を選びます。灰色は選択外、色付きが選択中。' +
-      (useRaster ? '（密度表示の散布図には選択外は表示されません）' : '');
-    coachMarkEl.hidden = hasEverSelected;
-    setChartStatus(`${useRaster ? '密度表示' : '点表示'}・${table.rowCount.toLocaleString()} 行`, false);
-  }
-
-  // 別ファイルを読み込むたびにリスナーが積み重ならないよう、addEventListener
-  // ではなく onchange で上書きする（積み重なると1回の変更でチャートが
-  // 読み込んだファイル数だけ作り直され、古いテーブルの列名で描こうとする）
-  xAxisSelectEl.onchange = rebuildCharts;
-  yAxisSelectEl.onchange = rebuildCharts;
-  colorSelectEl.onchange = rebuildCharts;
-  regressionToggleEl.onchange = rebuildCharts;
+  const canChart = xOptions(kinds).length > 0;
+  addChartEl.disabled = !canChart;
+  exportPngEl.hidden = exportSvgEl.hidden = !canChart;
+  for (const config of initialLayout({ kinds, bestPair, bestGroup })) await chartGrid.add(config);
+  coachMarkEl.hidden = hasEverSelected || chartGrid.configs.length === 0;
   coachMarkEl.onclick = () => (coachMarkEl.hidden = true);
+  setChartStatus(
+    autoPickError ??
+      `${table.rowCount.toLocaleString()} 行${cols.numericCols.length >= 2 ? `・散布図は${useRaster ? '密度表示' : '点表示'}` : ''}`,
+    autoPickError !== null
+  );
+
+  addChartEl.onclick = async () => {
+    const next = suggestNextChart(kinds, chartGrid.configs);
+    if (next) {
+      await chartGrid.add(next);
+      plotsEl.lastElementChild?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  };
 
   // ---- 図の書き出し ----
   async function exportFigure(kind: 'png' | 'svg') {
     const brush = describeBrush($brush);
-    const color = colorSelectEl.value;
+    const charts = chartGrid.configs.map((c) => `${CHART_LABELS[c.type]}（${c.y ? `${c.x}×${c.y}` : c.x}）`);
     const caption = {
       title: `Brushlink — ${fileName}`,
       lines: [
-        `X: ${xAxisSelectEl.value} / Y: ${yAxisSelectEl.value}${color ? ` / 色: ${color}` : ''}`,
+        `グラフ: ${charts.join('、')}`,
         `${brush.texts.length ? `選択中 ${(state.selStats?.rows ?? 0).toLocaleString()} 件` : '選択なし'} / 母集団 ${(state.popStats?.rows ?? 0).toLocaleString()} 件 / 全体 ${table.rowCount.toLocaleString()} 件`,
-        `選択範囲: ${brush.texts.join('、') || 'なし'}`,
+        `選択: ${brush.texts.join('、') || 'なし'}`,
         `絞り込み: ${filterDescriptions.join('、') || 'なし'}`,
       ],
     };
@@ -941,8 +841,6 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
   }
   exportPngEl.onclick = () => exportFigure('png');
   exportSvgEl.onclick = () => exportFigure('svg');
-
-  await rebuildCharts();
 }
 
 /**

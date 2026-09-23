@@ -1,5 +1,17 @@
-// チャート生成：散布図（軸選択・dot/raster自動切替）とヒストグラム。
-// Python版 src/charts.py 相当。
+// チャート生成。散布図（dot/raster 自動切替・回帰直線）、ヒストグラム、
+// 棒グラフ（件数・平均）、平均±誤差棒、折れ線。種類と列の組み合わせの規則は
+// chartTypes.ts、画面への並べ方は chartGrid.ts。
+//
+// どの種類も同じ2層構成にしてある: 灰色の層が母集団（$filter のみで絞る）、
+// 色付きの層が選択中（$brush で絞る。カテゴリのグラフだけは $selected で、
+// 理由は CategoryChartContext に書いた）。選択の操作は、数値の軸なら範囲の
+// ドラッグ（intervalX / intervalXY）、カテゴリの軸ならクリック（toggleX）で、
+// どちらも $brush に書き込むので、すべてのグラフと統計量が連動する。
+//
+// vgplot に無いマークは作らない。箱ひげ図は vgplot（mosaic-plot）に対応する
+// マークが無く、ひげの端（四分位範囲の1.5倍以内で最も外側の値）は集計関数
+// 1つでは求まらないため、既存マークの組み合わせでは正しい箱ひげ図にならない。
+// よって種類に加えていない。
 
 import type { Coordinator } from '@uwdata/vgplot';
 import { quoteIdent } from './sql';
@@ -23,7 +35,13 @@ import {
   yLabel,
   regressionY,
   colorDomain,
+  barY,
+  ruleX,
+  lineY,
+  toggleX,
+  xDomain,
 } from '@uwdata/vgplot';
+import { avg, stddev, sqrt, div, sub, add } from '@uwdata/mosaic-sql';
 
 
 // dot と raster の自動切替閾値。ユーザーには選ばせず、行数から自動判定する
@@ -37,6 +55,41 @@ import {
 // 計測点 15,000 を閾値にした（以前の 50,000 は、1万〜10万を計測しないまま
 // 置いた暫定値で、計測すると 5万行では毎フレーム約 280ms 止まっていた）。
 export const DOT_TO_RASTER_THRESHOLD = 15_000;
+
+/**
+ * カテゴリ列 × 数値列の組み合わせのうち、群間の差が最も大きいものを選ぶ。
+ * 誤差棒の初期表示を自動で組み立てるため（散布図の軸を相関で選ぶのと同じ考え方）。
+ * 差の大きさは相関比 η²（群間平方和 ÷ 全平方和）で測る。組み合わせが多いと
+ * テーブルを何度も走査するので、カテゴリ列は先頭5列、数値列は先頭10列までに絞る。
+ */
+export async function pickBestGroup(
+  db: Coordinator,
+  tableName: string,
+  catCols: string[],
+  numericCols: string[]
+): Promise<{ category: string; numeric: string; eta2: number } | null> {
+  const pairs: [string, string][] = [];
+  for (const c of catCols.slice(0, 5)) for (const n of numericCols.slice(0, 10)) pairs.push([c, n]);
+  if (pairs.length === 0) return null;
+  const t = quoteIdent(tableName);
+  const selects = pairs.map(([c, n], idx) => {
+    const qc = quoteIdent(c);
+    const qn = quoteIdent(n);
+    return `SELECT ${idx} AS idx, (
+        SELECT sum(g.cnt * (g.m - tot.m) * (g.m - tot.m)) / nullif(max(tot.sst), 0)
+        FROM (SELECT count(${qn}) AS cnt, avg(${qn}) AS m FROM ${t} WHERE ${qn} IS NOT NULL AND ${qc} IS NOT NULL GROUP BY ${qc}) g,
+             (SELECT avg(${qn}) AS m, var_pop(${qn}) * count(${qn}) AS sst FROM ${t} WHERE ${qn} IS NOT NULL AND ${qc} IS NOT NULL) tot
+      ) AS eta2`;
+  });
+  const result: any = await db.query(
+    `SELECT * FROM (${selects.join(' UNION ALL ')}) ORDER BY eta2 DESC NULLS LAST LIMIT 1`,
+    { cache: false }
+  );
+  const row = result.toArray()[0];
+  if (!row || row.eta2 === null) return null;
+  const [category, numeric] = pairs[Number(row.idx)];
+  return { category, numeric, eta2: Number(row.eta2) };
+}
 
 export interface AxisPair {
   x: string;
@@ -92,6 +145,9 @@ const ACCENT_FILL = '#2563eb';
 // 選択中の点がくすんで見えるため、薄いアクセント色の塗りと枠線にする。
 // 属性として付くので、図の書き出し（export.ts）にもそのまま反映される
 const BRUSH_STYLE = { fill: ACCENT_FILL, fillOpacity: 0.07, stroke: ACCENT_FILL, strokeWidth: 1.5 };
+// 母集団の層の線・点の色（背景の塗りより少し濃くして、誤差棒や折れ線でも見えるように）
+const POPULATION_STROKE = '#9aa3b2';
+
 
 export interface ScatterConfig {
   tableName: string;
@@ -220,5 +276,151 @@ export function buildHistogram(
     yLabel('件数'),
     width(size.width),
     height(size.height)
+  );
+}
+
+export interface CategoryChartContext {
+  tableName: string;
+  population: Selection;
+  brush: Selection;
+  // 色付きの層（選択中）を絞る Selection。カテゴリのグラフだけは $brush ではなく
+  // $selected（intersect）を使う。crossfilter の $brush は「自分のグラフで
+  // クリックした選択を自分には効かせない」ので、クリックしても自分の棒は
+  // 全部色付きのままで、どれを選んだか分からない。intersect なら、クリック
+  // したカテゴリだけが色付きで残り、他は灰色になる（他のグラフと同じ見え方）。
+  // vgplot の highlight でも同じことをしようとしたが、highlight は選択の条件を
+  // 集計済みの行に当てはめるため、$brush に合流している絞り込みの条件
+  // （集計のキーではない列の範囲）で SQL が失敗し、グラフが描けなかった。
+  // 集計済みの少ない行を引き直すだけなので、即時に追従させても軽い
+  selected: Selection;
+  // 横軸に並べるカテゴリ（絞り込み前の全カテゴリ）。固定しないと、絞り込みで
+  // カテゴリが消えるたびに並びと位置が変わり、クリックしたい棒が動いてしまう
+  categories: unknown[];
+  size: { width: number; height: number };
+}
+
+function categoryDomain(values: unknown[]): unknown[] {
+  // 欠測（NULL）のカテゴリはクリックで選べない（等号で比べられない）ので軸に出さない
+  return values.filter((v) => v !== null && v !== undefined);
+}
+
+/**
+ * 棒グラフ（件数）。カテゴリの棒をクリックして選ぶ。
+ *
+ * クリックの受け手（toggleX）は、常に全カテゴリが揃っている母集団の層にする。
+ * 選択中の層を受け手にすると、他のグラフの選択で件数が0になったカテゴリは
+ * 棒が消えてクリックできなくなるため。選択中の層は上に重なるので
+ * pointerEvents: none にして、クリックを下の母集団の層へ通す。
+ */
+export function buildBarCount(column: string, ctx: CategoryChartContext): HTMLElement {
+  return plot(
+    barY(from(ctx.tableName, { filterBy: ctx.population }), { x: column, y: count(), fill: BACKGROUND_FILL, inset: 2 }),
+    toggleX({ as: ctx.brush }),
+    barY(from(ctx.tableName, { filterBy: ctx.selected }), {
+      x: column,
+      y: count(),
+      fill: ACCENT_FILL,
+      inset: 2,
+      pointerEvents: 'none',
+    }),
+    xDomain(categoryDomain(ctx.categories)),
+    // カテゴリ軸の見出しは目盛りのラベルと重なるので出さない（列名はカードの見出しにある）
+    xLabel(null),
+    yLabel('↑ 件数'),
+    width(ctx.size.width),
+    height(ctx.size.height)
+  );
+}
+
+/**
+ * 棒グラフ（平均）。灰色の太い棒が母集団の平均、その上に重ねた細い棒が
+ * 選択中の平均。重ねて幅を変えることで、2つの平均を同じ位置で見比べられる。
+ */
+export function buildBarMean(column: string, value: string, ctx: CategoryChartContext): HTMLElement {
+  return plot(
+    barY(from(ctx.tableName, { filterBy: ctx.population }), { x: column, y: avg(value), fill: BACKGROUND_FILL, inset: 2 }),
+    toggleX({ as: ctx.brush }),
+    barY(from(ctx.tableName, { filterBy: ctx.selected }), {
+      x: column,
+      y: avg(value),
+      fill: ACCENT_FILL,
+      inset: 10,
+      pointerEvents: 'none',
+    }),
+    xDomain(categoryDomain(ctx.categories)),
+    // カテゴリ軸の見出しは目盛りのラベルと重なるので出さない（列名はカードの見出しにある）
+    xLabel(null),
+    yLabel(`↑ ${value}（平均）`),
+    width(ctx.size.width),
+    height(ctx.size.height)
+  );
+}
+
+/**
+ * 平均±誤差棒。誤差は標準誤差（SE = SD / √n）が既定で、標準偏差（SD）に
+ * 切り替えられる。SE は「平均がどれだけ確かか」、SD は「個々の値がどれだけ
+ * ばらつくか」で、比較の目的によって使い分けるため。
+ *
+ * vgplot の errorbarY マークは「平均 ± 信頼水準に応じた倍数 × SE」しか描けず、
+ * SD を選べない。そのため、vgplot の既存マーク ruleX（縦線）と dot（点）に、
+ * 平均・SD・SE の SQL 集計式を直接渡して描いている（新しいマークは作っていない）。
+ * 母集団（灰）と選択中（青）を左右に少しずらして並べる。
+ *
+ * クリックの受け手は、母集団の平均の位置に置いた見えない大きな点。
+ * 線や小さな点だけだと細すぎてクリックしにくいため。
+ */
+export function buildErrorBar(column: string, value: string, error: 'se' | 'sd', ctx: CategoryChartContext): HTMLElement {
+  const err = error === 'se' ? div(stddev(value), sqrt(count(value))) : stddev(value);
+  const low = sub(avg(value), err);
+  const high = add(avg(value), err);
+  const pop = from(ctx.tableName, { filterBy: ctx.population });
+  const sel = from(ctx.tableName, { filterBy: ctx.selected });
+  const OFFSET = 7;
+  return plot(
+    ruleX(pop, { x: column, y1: low, y2: high, stroke: POPULATION_STROKE, strokeWidth: 2, dx: -OFFSET, pointerEvents: 'none' }),
+    dot(pop, { x: column, y: avg(value), fill: POPULATION_STROKE, r: 4.5, dx: -OFFSET, pointerEvents: 'none' }),
+    ruleX(sel, { x: column, y1: low, y2: high, stroke: ACCENT_FILL, strokeWidth: 2.5, dx: OFFSET, pointerEvents: 'none' }),
+    dot(sel, { x: column, y: avg(value), fill: ACCENT_FILL, r: 5, dx: OFFSET, pointerEvents: 'none' }),
+    // クリックの受け手（見えない大きな点）
+    dot(pop, { x: column, y: avg(value), r: 22, fill: ACCENT_FILL, fillOpacity: 0 }),
+    toggleX({ as: ctx.brush }),
+    xDomain(categoryDomain(ctx.categories)),
+    // カテゴリ軸の見出しは目盛りのラベルと重なるので出さない（列名はカードの見出しにある）
+    xLabel(null),
+    yLabel(`↑ ${value}（平均 ± ${error === 'se' ? '標準誤差' : '標準偏差'}）`),
+    width(ctx.size.width),
+    height(ctx.size.height)
+  );
+}
+
+/**
+ * 折れ線（横軸の値ごとの平均）。横軸は日付・時刻、または整数（順序）の列。
+ * 数値の軸なので、範囲の選択は横方向のドラッグ。
+ */
+export function buildLine(
+  column: string,
+  value: string,
+  ctx: Omit<CategoryChartContext, 'categories' | 'selected'>
+): HTMLElement {
+  return plot(
+    lineY(from(ctx.tableName, { filterBy: ctx.population }), {
+      x: column,
+      y: avg(value),
+      stroke: POPULATION_STROKE,
+      strokeWidth: 1.5,
+      curve: 'monotone-x',
+    }),
+    lineY(from(ctx.tableName, { filterBy: ctx.brush }), {
+      x: column,
+      y: avg(value),
+      stroke: ACCENT_FILL,
+      strokeWidth: 2.5,
+      curve: 'monotone-x',
+    }),
+    intervalX({ as: ctx.brush, brush: BRUSH_STYLE }),
+    xLabel(`${column} →`),
+    yLabel(`↑ ${value}（平均）`),
+    width(ctx.size.width),
+    height(ctx.size.height)
   );
 }

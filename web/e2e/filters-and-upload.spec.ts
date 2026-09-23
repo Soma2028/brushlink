@@ -1,7 +1,7 @@
 // 絞り込みパネルとファイル読み込み。過去に見つかった不具合の再発防止を含む。
 
 import { test, expect } from '@playwright/test';
-import { openApp, loadSample, loadCsv, countOf, makeCsv, drag, histX, statsRow, waitForSelection } from './helpers';
+import { openApp, loadSample, loadCsv, countOf, makeCsv, drag, histX, statsRow, waitForSelection, control } from './helpers';
 
 test('スライダーに触れただけでは母集団が減らない（最大値の行が落ちる不具合の再発防止）', async ({ page }) => {
   await loadSample(page);
@@ -46,7 +46,8 @@ test('タイトル行・単位行のある CSV でもヘッダ行を推定し、
   await openApp(page);
   await loadCsv(page, path, 200);
   await expect(page.locator('#uploadStatus')).toContainText('ヘッダ: 2 行目');
-  await expect(page.locator('#xAxisSelect option')).toHaveText(['a', 'b', 'c']);
+  // 読み込んだ列（group は カテゴリ、a・b・c は数値）がグラフの X の選択肢に出る
+  await expect(control(page, 'scatter', 'x').locator('option')).toHaveText(['a', 'b', 'c', 'group']);
 
   // 別の行（0行目）をヘッダに選び直すと、その行を列名として読み込み直す
   await page.click('#previewDetails summary');

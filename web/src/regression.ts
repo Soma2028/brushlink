@@ -6,7 +6,7 @@
 // 散布図上の直線そのものは vgplot の regressionY マーク（charts.ts）が描く。
 
 import { makeClient } from '@uwdata/mosaic-core';
-import type { Selection } from '@uwdata/mosaic-core';
+import type { Selection, MosaicClient } from '@uwdata/mosaic-core';
 import { Query, regrSlope, regrIntercept, regrR2, regrCount, corr, stddev } from '@uwdata/mosaic-sql';
 import type { Coordinator } from '@uwdata/vgplot';
 import { correlationPValue, formatP } from './inference';
@@ -58,10 +58,11 @@ export function connectRegressionClients(
   $filter: Selection,
   $selected: Selection,
   onUpdate: (selected: RegressionResult | null, population: RegressionResult | null) => void
-) {
+): MosaicClient[] {
   let selected: RegressionResult | null = null;
   let population: RegressionResult | null = null;
-  makeClient({
+  // グラフのカードを消したときに切断できるよう、作ったクライアントを返す
+  const popClient = makeClient({
     coordinator: db,
     // 事前集計（preaggregation）を使わせない。Mosaic の事前集計はブラシの
     // 範囲を画面のピクセル単位に丸めて集計するため、描画には十分でも
@@ -74,7 +75,7 @@ export function connectRegressionClients(
       onUpdate(selected, population);
     },
   });
-  makeClient({
+  const selClient = makeClient({
     coordinator: db,
     filterStable: false, // 上と同じ理由で事前集計を使わせない
     selection: $selected,
@@ -84,6 +85,7 @@ export function connectRegressionClients(
       onUpdate(selected, population);
     },
   });
+  return [popClient, selClient];
 }
 
 /**

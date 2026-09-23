@@ -2,16 +2,16 @@
 
 import { test, expect } from '@playwright/test';
 import { readFileSync } from 'node:fs';
-import { openApp, loadSample, loadCsv, makeCsv, drag, scatter, histX, waitForSelection } from './helpers';
+import { openApp, loadSample, loadCsv, makeCsv, drag, scatter, histX, waitForSelection, card, control } from './helpers';
 
 test('クラスタ分析を列として追加すると、散布図がクラスタで色分けされる', async ({ page }) => {
   await loadSample(page);
   await page.click('[role=tab][data-tab=cluster]');
   await expect(page.locator('#clusterPanel')).toContainText('つのクラスタ');
   await page.click('#clusterPanel .ml-apply');
-  await expect(page.locator('#colorSelect')).toHaveValue('クラスタ');
+  await expect(control(page, 'scatter', 'color')).toHaveValue('クラスタ');
   // 欠測で割り当てられない行は null ではなく名前付きのカテゴリになる
-  await expect(page.locator('.legend-wrap')).toContainText('（欠測あり）');
+  await expect(card(page, 'scatter').locator('.legend-wrap')).toContainText('（欠測あり）');
 });
 
 test('主成分を軸にした後も、そのチャートでドラッグ選択できる', async ({ page }) => {
@@ -19,10 +19,11 @@ test('主成分を軸にした後も、そのチャートでドラッグ選択�
   await page.click('[role=tab][data-tab=pca]');
   await expect(page.locator('#pcaPanel')).toContainText('寄与率');
   await page.click('#pcaPanel .ml-apply');
-  await expect(page.locator('#xAxisSelect')).toHaveValue('主成分1');
-  await expect(page.locator('#yAxisSelect')).toHaveValue('主成分2');
+  await expect(control(page, 'scatter', 'x')).toHaveValue('主成分1');
+  await expect(control(page, 'scatter', 'y')).toHaveValue('主成分2');
 
-  await drag(page, histX(page), [0.2, 0.5], [0.5, 0.5]);
+  // 主成分は散布図の軸になる（ヒストグラムは元の列のまま）。散布図の上で選ぶ
+  await drag(page, scatter(page), [0.3, 0.3], [0.7, 0.7]);
   await waitForSelection(page);
   await expect(page.locator('#conditionChips')).toContainText('選択: 主成分1');
 });
@@ -55,8 +56,8 @@ test('図を PNG / SVG で保存でき、SVG には条件の注記が入る', as
   const [svg] = await Promise.all([page.waitForEvent('download'), page.click('#exportSvg')]);
   const svgText = readFileSync((await svg.path())!, 'utf8');
   expect(svgText).toContain(`選択中 ${selected.toLocaleString('en-US')} 件`);
-  expect(svgText).toContain('選択範囲: 厚み');
-  expect(svgText).toContain('X: 厚み / Y: 強度');
+  expect(svgText).toContain('選択: 厚み');
+  expect(svgText).toContain('散布図 — 厚み × 強度');
 });
 
 test('1.5万行以上は密度表示（raster）になり、色分けは無効になる', async ({ page }) => {
@@ -64,7 +65,7 @@ test('1.5万行以上は密度表示（raster）になり、色分けは無効�
   await openApp(page);
   await loadCsv(page, path, 20_000);
   await expect(page.locator('#chartStatus')).toContainText('密度表示');
-  await expect(page.locator('#colorSelect')).toBeDisabled();
+  await expect(control(page, 'scatter', 'color')).toBeDisabled();
 
   await drag(page, histX(page), [0.3, 0.5], [0.6, 0.5]);
   const selected = await waitForSelection(page);

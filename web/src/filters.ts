@@ -38,10 +38,21 @@ export function isNumericType(duckType: string): boolean {
   return NUMERIC_TYPE_RE.test(duckType);
 }
 
+// 日付・時刻の型。カテゴリとしては扱わず、折れ線グラフの横軸に使う
+const TEMPORAL_TYPE_RE = /^(DATE|TIMESTAMP|TIME)/i;
+// 整数の型。「順序」（測定回・日数など）として折れ線の横軸にも使える
+const INTEGER_TYPE_RE = /^(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|UTINYINT|USMALLINT|UINTEGER|UBIGINT|UHUGEINT)/i;
+
+export function isTemporalType(duckType: string): boolean {
+  return TEMPORAL_TYPE_RE.test(duckType);
+}
+
 export interface ClassifiedColumns {
   numericCols: string[];
   catCols: string[]; // フィルタ・色分けの対象（低カーディナリティ）
   highCardCols: { name: string; cardinality: number }[]; // 除外した列と件数
+  temporalCols: string[]; // 日付・時刻（折れ線の横軸）
+  orderCols: string[]; // 整数の数値列（折れ線の横軸にも使える順序）
 }
 
 /**
@@ -55,7 +66,11 @@ export async function classifyColumns(
   columns: ColumnMeta[]
 ): Promise<ClassifiedColumns> {
   const numericCols = columns.filter((c) => isNumericType(c.type)).map((c) => c.name);
-  const catCandidates = columns.filter((c) => !isNumericType(c.type)).map((c) => c.name);
+  const orderCols = columns.filter((c) => INTEGER_TYPE_RE.test(c.type)).map((c) => c.name);
+  const temporalCols = columns.filter((c) => isTemporalType(c.type)).map((c) => c.name);
+  const catCandidates = columns
+    .filter((c) => !isNumericType(c.type) && !isTemporalType(c.type))
+    .map((c) => c.name);
 
   const catCols: string[] = [];
   const highCardCols: { name: string; cardinality: number }[] = [];
@@ -78,7 +93,7 @@ export async function classifyColumns(
     }
   }
 
-  return { numericCols, catCols, highCardCols };
+  return { numericCols, catCols, highCardCols, temporalCols, orderCols };
 }
 
 // 数値レンジスライダーの分解能。値域を何段階で動かせるか。
