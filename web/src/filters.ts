@@ -112,6 +112,9 @@ export interface CategoryFilter {
   column: string;
   options: string[];
   element: HTMLElement;
+  // この部品が $filter に書き込む節の出どころ。初期状態の節も同じ source で出し、
+  // 後の操作や作り直しで確実に置き換わる（別の source だと古い節が残り続ける）
+  source: object;
 }
 
 export interface FilterPanel {
@@ -120,6 +123,9 @@ export interface FilterPanel {
   categorical: CategoryFilter[];
   // すべてのフィルタを初期状態（全件を通す）に戻す
   reset: () => void;
+  // カテゴリ列の絞り込みを後から足す（同じ列が既にあれば作り直す）。
+  // 機械学習で「クラスタ」列を書き戻したとき、その列でも絞り込めるようにするため
+  setCategoryColumn: (column: string) => Promise<void>;
 }
 
 /**
@@ -360,7 +366,11 @@ export async function buildFilterPanel(
     numeric.push({ column: col, min: lo, max: hi, element: wrap });
   }
 
-  for (const col of cols.catCols) {
+  // 作り直しで捨てたカテゴリの部品の片付け（列名 → 片付ける関数）
+  const disposers = new Map<string, () => void>();
+
+  async function addCategoryWidget(col: string, publishNow: boolean) {
+    let alive = true;
     const result: any = await db.query(
       `SELECT DISTINCT ${quoteIdent(col)} AS v FROM ${quoteIdent(tableName)} WHERE ${quoteIdent(col)} IS NOT NULL ORDER BY v`,
       { cache: false }
@@ -397,7 +407,7 @@ export async function buildFilterPanel(
       notifyActive();
     };
     let current: string | null = null;
-    describers.push(() => current);
+    describers.push(() => (alive ? current : null));
     for (const opt of options) {
       const optLabel = document.createElement('label');
       optLabel.className = 'filter-checkbox';
@@ -421,13 +431,28 @@ export async function buildFilterPanel(
     wrap.append(head, chips);
     addNullsToggle(wrap, col, publish);
     resetters.push(() => {
+      if (!alive) return;
       for (const cb of checkboxes) cb.checked = true;
       publish();
     });
 
     container.appendChild(wrap);
-    categorical.push({ column: col, options, element: wrap });
+    const entry = { column: col, options, element: wrap, source };
+    categorical.push(entry);
+    disposers.set(col, () => {
+      alive = false;
+      wrap.remove();
+      categorical.splice(categorical.indexOf(entry), 1);
+      // この部品が $filter に入れていた条件を取り除く
+      filterSelection.update({ source, value: null, predicate: null } as unknown as SelectionClause);
+    });
+    if (publishNow) {
+      filterSelection.update(categoryInClause(col, options, source, true));
+      notifyActive();
+    }
   }
+
+  for (const col of cols.catCols) await addCategoryWidget(col, false);
 
   // 初期状態（全件を通す。欠測も含める）を明示的に発行する。
   // フィルタと選択は別系統だが、初期状態でも $filter に何らかの節が
@@ -439,9 +464,7 @@ export async function buildFilterPanel(
     );
   }
   for (const c of categorical) {
-    filterSelection.update(
-      categoryInClause(c.column, c.options, { kind: 'category-filter', column: c.column }, true)
-    );
+    filterSelection.update(categoryInClause(c.column, c.options, c.source, true));
   }
   notifyMissingIncluded();
 
@@ -450,7 +473,20 @@ export async function buildFilterPanel(
     notifyMissingIncluded();
   }
 
-  return { element: container, numeric, categorical, reset };
+  async function setCategoryColumn(column: string) {
+    disposers.get(column)?.();
+    disposers.delete(column);
+    // 新しい列の欠測件数（「欠測を含める」を出すかどうかの判断に使う）
+    const row: any = (
+      await db.query(`SELECT count(*) - count(${quoteIdent(column)}) AS m FROM ${quoteIdent(tableName)}`, { cache: false })
+    ).get(0);
+    nullCounts[column] = Number(row.m);
+    includeNullsByCol.delete(column);
+    await addCategoryWidget(column, true);
+    notifyMissingIncluded();
+  }
+
+  return { element: container, numeric, categorical, reset, setCategoryColumn };
 }
 
 function formatNumber(n: number): string {

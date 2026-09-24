@@ -40,8 +40,17 @@ import {
   lineY,
   toggleX,
   xDomain,
+  ruleY,
+  xAxis,
+  yAxis,
+  xTicks,
+  yTicks,
+  marginLeft,
+  marginBottom,
+  marginTop,
+  marginRight,
 } from '@uwdata/vgplot';
-import { avg, stddev, sqrt, div, sub, add } from '@uwdata/mosaic-sql';
+import { avg, stddev, sqrt, div, sub, add, sql, column as col } from '@uwdata/mosaic-sql';
 
 
 // dot と raster の自動切替閾値。ユーザーには選ばせず、行数から自動判定する
@@ -423,4 +432,122 @@ export function buildLine(
     width(ctx.size.width),
     height(ctx.size.height)
   );
+}
+
+export interface ResidualContext {
+  tableName: string;
+  rowCount: number;
+  population: Selection;
+  brush: Selection;
+  size: { width: number; height: number };
+}
+
+/**
+ * 回帰の残差プロット。横軸が X、縦軸が残差（Y − 回帰直線の予測値）。
+ * 回帰直線は母集団で当てはめたもの（slope・intercept）を定数として式に埋め込む。
+ * 残差は SQL の式として DuckDB で計算するので、点の数・描き方（dot / raster の
+ * 自動切替）・範囲選択は散布図と同じ扱いになる。縦方向の選択は「残差の範囲」
+ * として $brush に入る（残差の大きい外れ値だけを選ぶ、といった使い方ができる）。
+ * 母集団が変わると直線も変わるので、呼び出し側（chartGrid.ts）が作り直す。
+ */
+export function buildResidual(
+  x: string,
+  y: string,
+  fit: { slope: number; intercept: number },
+  ctx: ResidualContext
+): HTMLElement {
+  const residual = sql`${col(y)} - (${fit.slope} * ${col(x)} + ${fit.intercept})`;
+  const useRaster = ctx.rowCount >= DOT_TO_RASTER_THRESHOLD;
+  const fg = from(ctx.tableName, { filterBy: ctx.brush });
+  const marks = useRaster
+    ? [raster(fg, { x, y: residual, pixelSize: 2 })]
+    : [
+        dot(from(ctx.tableName, { filterBy: ctx.population }), { x, y: residual, fill: BACKGROUND_FILL, r: 2.5 }),
+        dot(fg, { x, y: residual, fill: ACCENT_FILL, r: 2.5, fillOpacity: 0.8 }),
+      ];
+  return plot(
+    // 残差0の基準線は先に描く。interactor（intervalXY）は直前のマークの列を
+    // 選択の対象にするので、基準線（列を持たない）を最後にすると、範囲選択の
+    // 条件が「NULL BETWEEN …」になって何も選べなくなる
+    ruleY([0], { stroke: POPULATION_STROKE, strokeDasharray: '5 3' }),
+    ...marks,
+    intervalXY({ as: ctx.brush, brush: BRUSH_STYLE }),
+    xLabel(`${x} →`),
+    yLabel(`↑ 残差（${y} − 予測値）`),
+    width(ctx.size.width),
+    height(ctx.size.height)
+  );
+}
+
+export interface SplomContext {
+  tableName: string;
+  rowCount: number;
+  population: Selection;
+  brush: Selection;
+  width: number;
+}
+
+/**
+ * 散布図行列。選んだ列の全ペアの小さな散布図を格子に並べ、対角にはその列の
+ * ヒストグラムを置く。どのマスでもドラッグで範囲を選べ、$brush に入る。
+ *
+ * dot / raster の切り替えは、行数ではなく「描き直す点の総数」（行数 × 対角以外の
+ * マスの数）で判定する。閾値 DOT_TO_RASTER_THRESHOLD の根拠は「1回の選択で
+ * 描き直す点が何個までなら止まらないか」の計測なので、マスが増えた分だけ
+ * 点の総数で比べるのが同じ基準になる。
+ * vgplot の plot を複数並べるので、個々の plot 要素の配列も返す（リサイズ用）。
+ */
+export function buildSplom(columns: string[], ctx: SplomContext): { element: HTMLElement; plots: HTMLElement[] } {
+  const k = columns.length;
+  const cell = Math.max(90, Math.floor((ctx.width - 12) / k));
+  const offDiagonal = k * (k - 1);
+  const useRaster = ctx.rowCount * offDiagonal >= DOT_TO_RASTER_THRESHOLD;
+  const grid = document.createElement('div');
+  grid.className = 'splom';
+  grid.style.gridTemplateColumns = `repeat(${k}, ${cell}px)`;
+  const plots: HTMLElement[] = [];
+  columns.forEach((yCol, row) => {
+    columns.forEach((xCol, colIndex) => {
+      const edgeLeft = colIndex === 0;
+      const edgeBottom = row === k - 1;
+      const common = [
+        width(cell),
+        height(cell),
+        marginLeft(edgeLeft ? 40 : 8),
+        marginBottom(edgeBottom ? 34 : 8),
+        marginTop(8),
+        marginRight(6),
+        xTicks(3),
+        yTicks(3),
+        xAxis(edgeBottom ? 'bottom' : null),
+        yAxis(edgeLeft ? 'left' : null),
+        xLabel(edgeBottom ? xCol : null),
+        yLabel(edgeLeft ? yCol : null),
+      ];
+      let el: HTMLElement;
+      if (row === colIndex) {
+        el = plot(
+          rectY(from(ctx.tableName, { filterBy: ctx.population }), { x: bin(xCol), y: count(), fill: BACKGROUND_FILL, inset: 0.5 }),
+          rectY(from(ctx.tableName, { filterBy: ctx.brush }), { x: bin(xCol), y: count(), fill: ACCENT_FILL, inset: 0.5 }),
+          intervalX({ as: ctx.brush, brush: BRUSH_STYLE }),
+          ...common,
+          yAxis(null),
+          yLabel(null)
+        );
+      } else {
+        const fg = from(ctx.tableName, { filterBy: ctx.brush });
+        const marks = useRaster
+          ? [raster(fg, { x: xCol, y: yCol, pixelSize: 2 })]
+          : [
+              dot(from(ctx.tableName, { filterBy: ctx.population }), { x: xCol, y: yCol, fill: BACKGROUND_FILL, r: 1.5 }),
+              dot(fg, { x: xCol, y: yCol, fill: ACCENT_FILL, r: 1.5, fillOpacity: 0.8 }),
+            ];
+        el = plot(...marks, intervalXY({ as: ctx.brush, brush: BRUSH_STYLE }), ...common);
+      }
+      el.classList.add('splom-cell');
+      plots.push(el);
+      grid.appendChild(el);
+    });
+  });
+  return { element: grid, plots };
 }

@@ -1906,3 +1906,107 @@ body.dragging .welcome {
     display: none;
   }
 }
+
+/* ---------- 統計用のグラフ（statCharts.ts）・散布図行列 ---------- */
+.stat-note {
+  margin: 0 0 0.25rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.stat-chart svg {
+  overflow: visible;
+  touch-action: none; /* 縦のドラッグで画面がスクロールしないように */
+}
+
+.splom {
+  display: grid;
+  gap: 0;
+}
+
+.splom svg {
+  overflow: visible;
+}
+
+.column-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 0.7rem;
+  margin: 0.2rem 0 0;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  flex-basis: 100%;
+}
+
+.column-picker legend {
+  font-size: 0.7rem;
+  color: var(--muted);
+  padding: 0 0.2rem;
+}
+
+.column-picker .inline-check {
+  margin: 0;
+}
+
+/* ---------- 階層クラスタ（hclustPanel.ts） ---------- */
+.hc-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.5rem;
+  font-size: 0.82rem;
+}
+
+.hc-summary select {
+  padding: 0.2rem 0.35rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+}
+
+.hc-summary .muted {
+  font-size: 0.76rem;
+}
+
+.hc-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-bottom: 0.5rem;
+}
+
+.cluster-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  padding: 0.15rem 0.6rem 0.15rem 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+.cluster-chip:hover {
+  border-color: var(--accent);
+}
+
+.cluster-chip small {
+  margin-left: 0.3rem;
+  color: var(--muted);
+}
+
+.hc-scroll {
+  overflow-x: auto;
+}
+
+.hc-band,
+.hc-dendro-hit {
+  cursor: pointer;
+}
+
+.hc-band:hover {
+  stroke: #1c2330;
+  stroke-width: 1.5;
+}

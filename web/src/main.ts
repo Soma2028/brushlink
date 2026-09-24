@@ -14,6 +14,8 @@
 //               機械学習）はこちらを使う
 
 import './style.css';
+// raster マークが0行の結果で落ちる不具合への対処（読み込むだけで効く）
+import './rasterPatch';
 import { DuckDBWASMConnector, coordinator, Selection } from '@uwdata/vgplot';
 import type { Coordinator } from '@uwdata/vgplot';
 import type { SelectionClause } from '@uwdata/mosaic-core';
@@ -46,6 +48,8 @@ import type { CategoryCounts } from './categories';
 import { renderInsights } from './insights';
 import { connectRowsClient } from './rows';
 import { createMLPanel } from './mlPanel';
+import { createHClustPanel } from './hclustPanel';
+import type { HClustPanel } from './hclustPanel';
 import type { MLPanel, MLTab, AddedColumns } from './mlPanel';
 import { composeFigure, downloadPng, downloadSvg } from './export';
 import { predicateSql } from './sql';
@@ -181,6 +185,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           <button type="button" role="tab" data-tab="cluster" aria-selected="false">クラスタ</button>
           <button type="button" role="tab" data-tab="pca" aria-selected="false">主成分</button>
           <button type="button" role="tab" data-tab="importance" aria-selected="false">変数重要度</button>
+          <button type="button" role="tab" data-tab="hclust" aria-selected="false">階層クラスタ</button>
           <span class="tab-sep"></span>
           <button type="button" role="tab" data-tab="rows" aria-selected="false">行データ</button>
         </div>
@@ -192,6 +197,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         <div role="tabpanel" data-panel="cluster" hidden><div id="clusterPanel" class="ml-panel"></div></div>
         <div role="tabpanel" data-panel="pca" hidden><div id="pcaPanel" class="ml-panel"></div></div>
         <div role="tabpanel" data-panel="importance" hidden><div id="importancePanel" class="ml-panel"></div></div>
+        <div role="tabpanel" data-panel="hclust" hidden><div id="hclustPanel" class="ml-panel"></div></div>
         <div role="tabpanel" data-panel="rows" hidden><div id="rowsPanel"></div></div>
       </section>
     </div>
@@ -294,10 +300,11 @@ function setChartStatus(message: string, isError: boolean) {
 // 詳細カードのタブ
 // ---------------------------------------------------------------------------
 
-type DetailTab = 'stats' | 'categories' | 'rows' | MLTab;
+type DetailTab = 'stats' | 'categories' | 'rows' | 'hclust' | MLTab;
 let activeTab: DetailTab = 'stats';
 // ファイルを読み込むたびに作り直す。タブ切り替えから機械学習の計算を起動するため
 let mlPanel: MLPanel | null = null;
+let hclustPanel: HClustPanel | null = null;
 
 function isMLTab(tab: DetailTab): tab is MLTab {
   return tab === 'cluster' || tab === 'pca' || tab === 'importance';
@@ -485,6 +492,7 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
   categoryPanelEl.innerHTML = '';
   rowsPanelEl.innerHTML = '';
   mlPanel = null;
+  hclustPanel = null;
 
   db.clear(); // 古いチャート・集計クライアントを切断する（既定で clients・cache とも true）
 
@@ -633,6 +641,8 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
     // 散布図ごとの回帰（「選択中」の行を出すかどうかが選択の有無で変わる）
     grid?.refreshRegression();
     mlPanel?.scopeChanged();
+    hclustPanel?.refreshScope();
+    hclustPanel?.refreshSelection();
   }
 
   // 集計系のクライアント（件数・統計量・カテゴリ構成・データ表）。グラフとは
@@ -717,12 +727,53 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
     selectedLive: $selected,
     populationSettled: $populationSettled,
     getKinds: () => kinds,
+    populationSql: () => predicateSql($filter.predicate(null)),
     categoryValues: valuesFor,
     hasSelection,
   });
   grid = chartGrid;
 
-  // ---- 機械学習パネル ----
+  // ---- 機械学習（k-means・PCA・変数重要度・階層クラスタ） ----
+  const analysisScope = () => ({
+    selectedSql: predicateSql($selected.predicate(null)),
+    populationSql: predicateSql($filter.predicate(null)),
+    hasSelection: hasSelection(),
+    selectedCount: state.selStats?.rows ?? 0,
+    populationCount: state.popStats?.rows ?? 0,
+    brushedCols: describeBrush($brush).cols,
+  });
+
+  /**
+   * 機械学習の結果が列として書き戻されたとき（クラスタ・主成分得点）。
+   * グラフの選択肢と絞り込みに新しい列を加え、結果を散布図に反映する。
+   */
+  async function handleColumnsAdded(added: AddedColumns) {
+    for (const c of added.numeric) if (!kinds.numeric.includes(c)) kinds.numeric.push(c);
+    for (const c of added.categorical) if (!kinds.category.includes(c)) kinds.category.push(c);
+    rowColumns.push(...[...added.numeric, ...added.categorical].filter((c) => !rowColumns.includes(c)));
+    for (const c of added.categorical) categoryValues.delete(c);
+    // 列の値を書き換えたので、Mosaic の事前集計（crossfilter 高速化用の
+    // 集計済みテーブル）とクエリのキャッシュを捨てる。残すと古い値が使われる
+    await db.preaggregator.dropSchema();
+    db.clear({ clients: false, cache: true });
+    connectRows();
+    // クラスタの列はカテゴリなので、絞り込みにも加える（同じ列なら作り直す）
+    for (const c of added.categorical) await panel.setCategoryColumn(c);
+    // 結果を最初の散布図に反映する（無ければ散布図を1枚足す）
+    const scatter = chartGrid.configs.find((c) => c.type === 'scatter');
+    const patch = {
+      ...(added.axes ? { x: added.axes[0], y: added.axes[1] } : {}),
+      ...(added.color ? { color: added.color } : {}),
+    };
+    if (scatter) {
+      await chartGrid.update(scatter.id, patch);
+    } else if (added.axes) {
+      await chartGrid.add(newChart({ type: 'scatter', x: added.axes[0], y: added.axes[1], color: added.color ?? null }));
+    }
+    // 新しい列を使っているグラフは作り直し、他は選択肢だけ更新する
+    await chartGrid.columnsChanged([...added.numeric, ...added.categorical]);
+  }
+
   mlPanel = createMLPanel({
     db,
     tableName: table.tableName,
@@ -733,38 +784,18 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
       pca: $<HTMLElement>('#pcaPanel'),
       importance: $<HTMLElement>('#importancePanel'),
     },
-    getScope: () => ({
-      selectedSql: predicateSql($selected.predicate(null)),
-      populationSql: predicateSql($filter.predicate(null)),
-      hasSelection: hasSelection(),
-      selectedCount: state.selStats?.rows ?? 0,
-      populationCount: state.popStats?.rows ?? 0,
-      brushedCols: describeBrush($brush).cols,
-    }),
-    onColumnsAdded: async (added: AddedColumns) => {
-      for (const c of added.numeric) if (!kinds.numeric.includes(c)) kinds.numeric.push(c);
-      for (const c of added.categorical) if (!kinds.category.includes(c)) kinds.category.push(c);
-      rowColumns.push(...[...added.numeric, ...added.categorical].filter((c) => !rowColumns.includes(c)));
-      for (const c of added.categorical) categoryValues.delete(c);
-      // 列の値を書き換えたので、Mosaic の事前集計（crossfilter 高速化用の
-      // 集計済みテーブル）とクエリのキャッシュを捨てる。残すと古い値が使われる
-      await db.preaggregator.dropSchema();
-      db.clear({ clients: false, cache: true });
-      connectRows();
-      // 結果を最初の散布図に反映する（無ければ散布図を1枚足す）
-      const scatter = chartGrid.configs.find((c) => c.type === 'scatter');
-      const patch = {
-        ...(added.axes ? { x: added.axes[0], y: added.axes[1] } : {}),
-        ...(added.color ? { color: added.color } : {}),
-      };
-      if (scatter) {
-        await chartGrid.update(scatter.id, patch);
-      } else if (added.axes) {
-        await chartGrid.add(newChart({ type: 'scatter', x: added.axes[0], y: added.axes[1], color: added.color ?? null }));
-      }
-      // 他のグラフの選択肢（X・Y・色の列）にも新しい列を出す
-      await chartGrid.rebuildAll();
-    },
+    getScope: analysisScope,
+    onColumnsAdded: handleColumnsAdded,
+  });
+  hclustPanel = createHClustPanel({
+    db,
+    tableName: table.tableName,
+    numericCols: cols.numericCols,
+    existingCols: table.columns.map((c) => c.name),
+    container: $<HTMLElement>('#hclustPanel'),
+    brush: $brush,
+    getScope: analysisScope,
+    onColumnsAdded: handleColumnsAdded,
   });
   selectTab(activeTab);
 

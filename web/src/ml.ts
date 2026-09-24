@@ -11,6 +11,8 @@
 // （ml.worker.ts）から呼ぶ。ランダムフォレストは数百ミリ秒かかることがあり、
 // メインスレッドで回すとドラッグ中の操作が引っかかるため。
 
+import { agnes } from 'ml-hclust';
+
 export type Matrix = number[][];
 
 /** シード付き疑似乱数（sample.ts と同じ mulberry32）。結果を再現可能にするため。 */
@@ -400,4 +402,100 @@ export function randomForestImportance(
   const oob = tp + fn > 0 && tn + fp > 0 ? (tp / (tp + fn) + tn / (tn + fp)) / 2 : null;
   const total = importance.reduce((s, v) => s + v, 0) || 1;
   return { importance: importance.map((v) => v / total), oobBalancedAccuracy: oob };
+}
+
+// ---------------------------------------------------------------------------
+// 階層クラスタリング（ml-hclust の agnes）
+// ---------------------------------------------------------------------------
+
+
+export type Linkage = 'ward' | 'average' | 'complete';
+
+/**
+ * 樹形図を Worker からメインスレッドへ渡せる平らな配列にしたもの。
+ * nodes[i] は葉なら leaf（元の行・列の番号）を、内部の節なら children を持つ。
+ * height は結合したときの距離（葉は 0）。root が根の番号。
+ */
+export interface FlatTree {
+  nodes: { height: number; children: number[]; leaf: number; size: number }[];
+  root: number;
+  order: number[]; // 樹形図が交差しない葉の並び（元の番号）
+}
+
+function flatten(tree: ReturnType<typeof agnes>): FlatTree {
+  const nodes: FlatTree['nodes'] = [];
+  const visit = (node: ReturnType<typeof agnes>): number => {
+    const children = node.isLeaf ? [] : node.children.map(visit);
+    nodes.push({ height: node.isLeaf ? 0 : node.height, children, leaf: node.isLeaf ? node.index : -1, size: node.size });
+    return nodes.length - 1;
+  };
+  const root = visit(tree);
+  return { nodes, root, order: tree.indices() };
+}
+
+/**
+ * 行（サンプル）と列（変数）の両方を階層クラスタリングする。
+ * 列の樹形図は、クラスタ付きヒートマップで似た列を隣に並べるためのもの。
+ * 行どうしの距離は rowSpace（z 値、または標準化しない設定なら元の値）で測る。
+ * 列どうしの距離は、行を並べたベクトル（常に z 値）どうしのユークリッド距離で、
+ * 行と同じ連結法を使う。
+ */
+export function hierarchical(rowSpace: Matrix, z: Matrix, method: Linkage): { rows: FlatTree; cols: FlatTree } {
+  const rows = flatten(agnes(rowSpace, { method }));
+  // 列どうしは単位が違うので、元の値のままでは比べられない。列の樹形図は常に z 値で作る
+  const transposed = z[0].map((_, j) => z.map((row) => row[j]));
+  const cols = transposed.length > 1 ? flatten(agnes(transposed, { method })) : { nodes: [{ height: 0, children: [], leaf: 0, size: 1 }], root: 0, order: [0] };
+  return { rows, cols };
+}
+
+/**
+ * 樹形図を k 個のクラスタに切る。根から、結合の高さが最も高い節を順に
+ * 2つに割っていき、k 個になったところで止める（ml-hclust の group(k) と同じ考え方）。
+ * 戻り値は各節（クラスタの根）の番号の配列。
+ */
+export function cutByCount(tree: FlatTree, k: number): number[] {
+  let groups = [tree.root];
+  while (groups.length < k) {
+    const splittable = groups.filter((g) => tree.nodes[g].children.length > 0);
+    if (splittable.length === 0) break;
+    const highest = splittable.reduce((a, b) => (tree.nodes[b].height > tree.nodes[a].height ? b : a));
+    groups = groups.filter((g) => g !== highest).concat(tree.nodes[highest].children);
+  }
+  return groups;
+}
+
+/** 高さ h で切ったときのクラスタ数（h より高い位置での結合をすべて切り離す）。 */
+export function countAtHeight(tree: FlatTree, h: number): number {
+  return tree.nodes.filter((n) => n.children.length > 0 && n.height > h).length + 1;
+}
+
+/** 各葉（元の番号）が属するクラスタの番号（groups の添字）。 */
+export function leafLabels(tree: FlatTree, groups: number[], n: number): number[] {
+  const labels = new Array(n).fill(-1);
+  groups.forEach((g, label) => {
+    const stack = [g];
+    while (stack.length) {
+      const node = tree.nodes[stack.pop()!];
+      if (node.leaf >= 0) labels[node.leaf] = label;
+      else stack.push(...node.children);
+    }
+  });
+  return labels;
+}
+
+/**
+ * クラスタ数を自動で決める。結合の高さを大きい順に並べ、隣り合う高さの差
+ * （= 樹形図の段差）が最も大きいところで切る。段差が大きいほど、そこで
+ * 分かれるクラスタどうしは互いに遠い（よく分かれている）ため。2〜maxK から選ぶ。
+ */
+export function autoClusterCount(tree: FlatTree, maxK = 8): number {
+  const heights = tree.nodes.filter((n) => n.children.length > 0).map((n) => n.height).sort((a, b) => b - a);
+  let bestK = 2;
+  let bestGap = -Infinity;
+  for (let k = 2; k <= Math.min(maxK, heights.length); k++) {
+    // k 個に切る = 上から k-1 個の結合を切り離す。段差は k-1 番目と k 番目の高さの差
+    const gap = heights[k - 2] - (heights[k - 1] ?? 0);
+    if (gap > bestGap) [bestGap, bestK] = [gap, k];
+  }
+  return bestK;
 }

@@ -126,19 +126,19 @@ test('選んだ列の型で、選べるグラフの種類と Y の列が変わ�
   await y.selectOption('');
   await expect(types).toHaveText(['棒グラフ（件数）']);
   await y.selectOption('濃度');
-  await expect(types).toHaveText(['平均±誤差棒', '棒グラフ（平均）']);
+  await expect(types).toHaveText(['平均±誤差棒', 'バイオリン図', '棒グラフ（平均）']);
   // カテゴリ列は Y に選べない（意味のない組み合わせを出さない）
   await expect(y.locator('option')).not.toContainText(['条件']);
 
   // 整数の列（時間）を X にすると、順序として折れ線も選べる。小数の列では選べない
   await x.selectOption('時間');
   await y.selectOption('濃度');
-  await expect(types).toHaveText(['散布図', '折れ線（平均）']);
+  await expect(types).toHaveText(['散布図', '回帰の残差プロット', '折れ線（平均）']);
   await x.selectOption('濃度');
   await y.selectOption('生存率');
-  await expect(types).toHaveText(['散布図']);
+  await expect(types).toHaveText(['散布図', '回帰の残差プロット']);
   await y.selectOption('');
-  await expect(types).toHaveText(['ヒストグラム']);
+  await expect(types).toHaveText(['ヒストグラム', 'Q-Q プロット']);
 });
 
 test('誤差は標準誤差が既定で、標準偏差に切り替えられる', async ({ page }) => {

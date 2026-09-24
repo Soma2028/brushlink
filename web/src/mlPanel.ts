@@ -56,7 +56,7 @@ const pending = new Map<number, (res: MLResponse) => void>();
 
 type DistributiveOmit<T, K extends keyof any> = T extends unknown ? Omit<T, K> : never;
 
-function runInWorker(req: DistributiveOmit<MLRequest, 'id'>): Promise<MLResponse> {
+export function runInWorker(req: DistributiveOmit<MLRequest, 'id'>): Promise<MLResponse> {
   if (!worker) {
     worker = new Worker(new URL('./ml.worker.ts', import.meta.url), { type: 'module' });
     worker.addEventListener('message', (e: MessageEvent<MLResponse>) => {
@@ -75,7 +75,7 @@ function runInWorker(req: DistributiveOmit<MLRequest, 'id'>): Promise<MLResponse
 // DuckDB からの行の取り出し
 // ---------------------------------------------------------------------------
 
-interface FeatureSelection {
+export interface FeatureSelection {
   used: string[];
   excludedMissing: string[];
   excludedConstant: string[];
@@ -85,7 +85,7 @@ interface FeatureSelection {
  * 機械学習に使う列を決める。欠測が多すぎる列・分析範囲内で値が一定の列を外す
  * （一定の列は標準化できず、情報も持たないため）。1クエリでまとめて調べる。
  */
-async function chooseFeatures(
+export async function chooseFeatures(
   db: Coordinator,
   tableName: string,
   candidates: string[],
@@ -145,14 +145,14 @@ function restSql(scope: AnalysisScope): string {
   return `(${scope.populationSql}) AND NOT COALESCE((${scope.selectedSql}), FALSE)`;
 }
 
-function uniqueName(base: string, taken: Set<string>): string {
+export function uniqueName(base: string, taken: Set<string>): string {
   if (!taken.has(base)) return base;
   let i = 2;
   while (taken.has(`${base}_${i}`)) i++;
   return `${base}_${i}`;
 }
 
-function zExpr(col: string, mean: number, sd: number): string {
+export function zExpr(col: string, mean: number, sd: number): string {
   return `((CAST(${quoteIdent(col)} AS DOUBLE) - ${mean}) / ${sd})`;
 }
 
@@ -172,7 +172,7 @@ function scopeText(scope: AnalysisScope): string {
     : `母集団の <strong>${scope.populationCount.toLocaleString()}</strong> 件（チャートで範囲を選ぶと、選んだ行だけで分析します）`;
 }
 
-function exclusionNote(features: FeatureSelection, incomplete: number): string {
+export function exclusionNote(features: FeatureSelection, incomplete: number): string {
   const notes: string[] = [];
   if (features.excludedMissing.length > 0) {
     notes.push(`欠測が ${MAX_MISSING_RATE * 100}% を超える列を除外: ${features.excludedMissing.map(escapeHtml).join('、')}`);

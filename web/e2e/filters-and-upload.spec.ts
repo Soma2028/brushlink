@@ -47,7 +47,7 @@ test('タイトル行・単位行のある CSV でもヘッダ行を推定し、
   await loadCsv(page, path, 200);
   await expect(page.locator('#uploadStatus')).toContainText('ヘッダ: 2 行目');
   // 読み込んだ列（group は カテゴリ、a・b・c は数値）がグラフの X の選択肢に出る
-  await expect(control(page, 'scatter', 'x').locator('option')).toHaveText(['a', 'b', 'c', 'group']);
+  await expect(control(page, 'scatter', 'x').locator('option')).toHaveText(['（数値列すべて）', 'a', 'b', 'c', 'group']);
 
   // 別の行（0行目）をヘッダに選び直すと、その行を列名として読み込み直す
   await page.click('#previewDetails summary');

@@ -8,8 +8,30 @@
 // ドラッグ、カテゴリの軸はクリックで選択する。連動に参加できないグラフは
 // 種類に加えない（CLAUDE.md「決まっていること」）。
 // 箱ひげ図は vgplot に対応するマークが無いため加えていない（charts.ts 参照）。
+// 相関行列・Q-Q・バイオリンは vgplot にマークが無いので、Observable Plot で
+// 描いて選択は自前で $brush に書き込む（statCharts.ts）。
 
-export type ChartType = 'scatter' | 'histogram' | 'bar-count' | 'bar-mean' | 'errorbar' | 'line';
+export type ChartType =
+  | 'scatter'
+  | 'histogram'
+  | 'bar-count'
+  | 'bar-mean'
+  | 'errorbar'
+  | 'line'
+  | 'qq'
+  | 'violin'
+  | 'residual'
+  | 'corr'
+  | 'splom';
+
+// X の選択肢の「数値列すべて」。相関行列・散布図行列のように、1列ではなく
+// 数値列全体を使うグラフのための特別な値
+export const ALL_NUMERIC = '__all_numeric__';
+
+// 散布図行列に並べる列の上限。5列で 5×5=25 枚の小さな図になり、カードの幅
+// （2列並びで約 460px〜）ではこれ以上並べると1枚が小さすぎて点が読めない。
+// 数値列がこれより多いときは、チェックで選んだ列だけを並べる
+export const MAX_SPLOM_COLUMNS = 5;
 
 export type ColumnKind = 'numeric' | 'category' | 'temporal' | 'none';
 
@@ -20,6 +42,11 @@ export const CHART_LABELS: Record<ChartType, string> = {
   'bar-mean': '棒グラフ（平均）',
   errorbar: '平均±誤差棒',
   line: '折れ線（平均）',
+  qq: 'Q-Q プロット',
+  violin: 'バイオリン図',
+  residual: '回帰の残差プロット',
+  corr: '相関行列',
+  splom: '散布図行列',
 };
 
 // 選択のしかた（グラフの上に出す操作の案内に使う）
@@ -30,6 +57,11 @@ export const CHART_HINTS: Record<ChartType, string> = {
   'bar-mean': '棒をクリックして選択（Shift で複数）',
   errorbar: '平均の点をクリックして選択（Shift で複数）',
   line: '横にドラッグして選択',
+  qq: '縦にドラッグして値の範囲を選択。点が斜めの線に沿うほど正規分布に近い',
+  violin: 'クリックでカテゴリ、縦にドラッグで値の範囲を選択',
+  residual: '四角くドラッグして選択。残差が0の横線の周りに偏りなく散らばっていれば、直線の当てはめが妥当',
+  corr: 'セルをクリックすると、散布図の X・Y がその2列に切り替わる',
+  splom: 'どの小さな散布図でもドラッグして選択',
 };
 
 export interface ChartConfig {
@@ -40,6 +72,7 @@ export interface ChartConfig {
   color: string | null; // 散布図の色分け列
   regression: boolean; // 散布図に回帰直線を重ねるか
   error: 'se' | 'sd'; // 誤差棒の誤差の種類（標準誤差 / 標準偏差）
+  columns: string[] | null; // 散布図行列に並べる列（null なら自動で先頭から上限まで）
 }
 
 export interface ColumnKinds {
@@ -60,22 +93,24 @@ export function kindOf(kinds: ColumnKinds, column: string | null): ColumnKind {
 /**
  * X・Y 列の組み合わせで描けるグラフ。先頭が既定（自動で選ぶもの）。
  *
- * - 数値 × 数値 → 散布図（整数の X なら折れ線も。「順序」として読めるため）
- * - 数値 × なし → ヒストグラム
+ * - 数値 × 数値 → 散布図、残差プロット（整数の X なら折れ線も。「順序」として読めるため）
+ * - 数値 × なし → ヒストグラム、Q-Q プロット
  * - カテゴリ × なし → 棒グラフ（件数）
- * - カテゴリ × 数値 → 平均±誤差棒、棒グラフ（平均）
+ * - カテゴリ × 数値 → 平均±誤差棒、バイオリン図、棒グラフ（平均）
+ * - 数値列すべて → 相関行列、散布図行列
  * - 日付 × 数値 → 折れ線
  * カテゴリは X にだけ置く（縦向きの誤差棒・棒グラフに揃えるため）。
  */
 export function availableTypes(kinds: ColumnKinds, x: string, y: string | null): ChartType[] {
+  if (x === ALL_NUMERIC) return kinds.numeric.length >= 2 ? ['corr', 'splom'] : [];
   const kx = kindOf(kinds, x);
   const ky = kindOf(kinds, y);
   if (kx === 'numeric' && ky === 'numeric') {
-    return kinds.order.includes(x) ? ['scatter', 'line'] : ['scatter'];
+    return kinds.order.includes(x) ? ['scatter', 'residual', 'line'] : ['scatter', 'residual'];
   }
-  if (kx === 'numeric' && ky === 'none') return ['histogram'];
+  if (kx === 'numeric' && ky === 'none') return ['histogram', 'qq'];
   if (kx === 'category' && ky === 'none') return ['bar-count'];
-  if (kx === 'category' && ky === 'numeric') return ['errorbar', 'bar-mean'];
+  if (kx === 'category' && ky === 'numeric') return ['errorbar', 'violin', 'bar-mean'];
   if (kx === 'temporal' && ky === 'numeric') return ['line'];
   return [];
 }
@@ -85,13 +120,14 @@ export function availableTypes(kinds: ColumnKinds, x: string, y: string | null):
  * （意味のない組み合わせを選択肢から外す）。日付の X には数値の Y が必須。
  */
 export function yOptions(kinds: ColumnKinds, x: string): { allowNone: boolean; columns: string[] } {
+  if (x === ALL_NUMERIC) return { allowNone: true, columns: [] };
   const kx = kindOf(kinds, x);
   if (kx === 'temporal') return { allowNone: false, columns: kinds.numeric };
   return { allowNone: true, columns: kinds.numeric.filter((c) => c !== x) };
 }
 
 export function xOptions(kinds: ColumnKinds): string[] {
-  return [...kinds.numeric, ...kinds.category, ...kinds.temporal];
+  return [...(kinds.numeric.length >= 2 ? [ALL_NUMERIC] : []), ...kinds.numeric, ...kinds.category, ...kinds.temporal];
 }
 
 let nextChartId = 1;
@@ -103,6 +139,7 @@ export function newChart(partial: Omit<Partial<ChartConfig>, 'id'> & { type: Cha
     color: null,
     regression: true,
     error: 'se',
+    columns: null,
     ...partial,
   };
 }

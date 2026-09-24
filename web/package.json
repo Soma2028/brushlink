@@ -17,10 +17,13 @@
   },
   "dependencies": {
     "@duckdb/duckdb-wasm": "^1.33.1-dev57.0",
+    "@observablehq/plot": "^0.6.17",
     "@uwdata/mosaic-core": "^0.31.0",
+    "@uwdata/mosaic-plot": "^0.31.0",
     "@uwdata/mosaic-sql": "^0.31.0",
     "@uwdata/vgplot": "^0.31.0",
     "jstat": "^1.9.6",
+    "ml-hclust": "^4.0.0",
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   }
 }

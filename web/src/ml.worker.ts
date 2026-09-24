@@ -2,7 +2,7 @@
 // ランダムフォレストなどを別スレッドで回し、計算中もドラッグや
 // スクロールが引っかからないようにする。
 
-import { standardize, kmeans, chooseK, pca, randomForestImportance } from './ml';
+import { standardize, kmeans, chooseK, pca, randomForestImportance, hierarchical } from './ml';
 import type { MLRequest, MLResponse } from './ml-protocol';
 
 // tsconfig の lib が DOM 前提のため、Worker 側の postMessage の型を最小限で宣言する
@@ -30,6 +30,12 @@ self.addEventListener('message', (event: MessageEvent<MLRequest>) => {
       const { z, means, sds } = standardize(req.X);
       const result = pca(z);
       ctx.postMessage({ id: req.id, type: 'pca', ...result, means, sds });
+    } else if (req.type === 'hclust') {
+      const t0 = performance.now();
+      const { z, means, sds } = standardize(req.X);
+      // 標準化しない設定では、元の値のまま距離を測る（単位の大きい列が効きやすくなる）
+      const { rows, cols } = hierarchical(req.standardize ? z : req.X, z, req.method);
+      ctx.postMessage({ id: req.id, type: 'hclust', rows, cols, Z: z, means, sds, ms: performance.now() - t0 });
     } else {
       const result = randomForestImportance(req.X, req.y);
       ctx.postMessage({ id: req.id, type: 'importance', ...result });

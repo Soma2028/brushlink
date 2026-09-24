@@ -54,8 +54,15 @@ export async function loadCsv(page: Page, path: string, total: number) {
  * ドラッグがバーの上で起きてしまう）。座標は対象の幅・高さに対する割合。
  */
 export async function drag(page: Page, target: Locator, from: [number, number], to: [number, number], steps = 12) {
-  await target.evaluate((el) => el.scrollIntoView({ block: 'center' }));
-  const box = await target.boundingBox();
+  // 自作のグラフ（statCharts.ts）は集計が届くたびに svg ごと作り直すので、
+  // スクロールしてから位置を測るまでの間に要素が差し替わることがある。
+  // その場合は探し直す（ロケーターは毎回その時点の要素を指し直す）
+  let box: { x: number; y: number; width: number; height: number } | null = null;
+  for (let attempt = 0; attempt < 5 && !box; attempt++) {
+    await target.evaluate((el) => el.scrollIntoView({ block: 'center' })).catch(() => {});
+    box = await target.boundingBox().catch(() => null);
+    if (!box) await page.waitForTimeout(200);
+  }
   if (!box) throw new Error('ドラッグ対象が表示されていません');
   await page.mouse.move(box.x + box.width * from[0], box.y + box.height * from[1]);
   await page.mouse.down();
