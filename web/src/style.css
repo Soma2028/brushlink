@@ -1391,6 +1391,30 @@ body.dragging .welcome {
   color: var(--muted);
 }
 
+/* ---------- 重回帰（multiRegression.ts） ---------- */
+.mreg-table thead th {
+  text-align: center;
+}
+
+.mreg-table .mreg-sel-head {
+  color: var(--accent-strong);
+}
+
+.mreg-table tr.mreg-fit th,
+.mreg-table tr.mreg-fit td {
+  color: var(--muted);
+}
+
+.mreg-table tr.mreg-fit-first th,
+.mreg-table tr.mreg-fit-first td {
+  border-top: 1px solid var(--border-strong);
+}
+
+.mreg-vif-warn {
+  color: var(--warn);
+  font-weight: 700;
+}
+
 /* ---------- カテゴリ構成 ---------- */
 .cat-block {
   padding: 0.7rem 0 0.9rem;

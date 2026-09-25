@@ -4,12 +4,16 @@ declare module 'jstat' {
   interface Distribution {
     cdf(x: number, dof: number): number;
   }
+  interface FDistribution {
+    cdf(x: number, df1: number, df2: number): number;
+  }
   interface NormalDistribution {
     inv(p: number, mean: number, sd: number): number;
   }
   interface JStatStatic {
     studentt: Distribution;
     chisquare: Distribution;
+    centralF: FDistribution;
     normal: NormalDistribution;
   }
   const jStat: JStatStatic;

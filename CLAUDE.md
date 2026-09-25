@@ -72,7 +72,7 @@ npx playwright install   # 初回のみ。WebKit・Firefox 本体の取得
 |---|---|---|
 | データ | DuckDB-WASM | ブラウザ内で動くインメモリ列指向エンジン。CSV/Excelを読み込みSQLで扱う |
 | 可視化・連動 | Mosaic (`@uwdata/vgplot`) | チャート間の選択連動（`Selection.crossfilter`）とSQL集計の橋渡し |
-| 統計 | jStat | t 分布・χ² 分布の累積分布関数（p 値）のみ。集計自体は DuckDB 側 |
+| 統計 | jStat | t 分布・χ² 分布・F 分布の累積分布関数（p 値）のみ。集計自体は DuckDB 側 |
 | 機械学習 | 自前実装（`ml.ts`、Web Worker）＋ ml-hclust | k-means・PCA・ランダムフォレストは自前、階層クラスタリングは ml-hclust の agnes |
 | 統計グラフの描画 | Observable Plot（`@observablehq/plot`） | vgplot にマークの無い相関行列・Q-Q・バイオリン図の描画だけに使う。集計と連動は Mosaic |
 | テスト | Playwright (`@playwright/test`) | 本番ビルドをブラウザで操作する e2e テスト（開発時のみ） |
@@ -99,6 +99,7 @@ web/
     stats.ts         件数・要約統計量・選択中 vs 選択外の比較
     categories.ts    カテゴリ構成の比較（χ² 検定）
     regression.ts    単回帰の集計と文章化
+    multiRegression.ts 重回帰のタブ（平均・共分散を SQL で集計し、係数は JS で解く）
     inference.ts     検定（Welch の t、χ²、選択外の分散の逆算）。jStat はここだけ
     insights.ts      選択範囲の特徴の文章要約
     rows.ts          選択中の行のデータ表
@@ -209,6 +210,13 @@ docs/
   ライブラリで直ったら消す。
 - **グラフの設定を変えたり削除したりしたら、そのグラフが作った選択だけを解除する。**
   他のグラフの選択は残す（`chartGrid.ts` の dispose）。
+- **重回帰はグラフではなくタブ**（`multiRegression.ts`）。係数の表は $brush に
+  参加できないため（グラフの種類を足す条件に合わない）。母集団（$filter のミラー）と
+  選択中（$selected のミラー）の2本を当てはめて並べる。DuckDB で平均と全ペアの
+  共分散を1クエリで集計し（欠測はリストワイズ除去）、相関行列に直して JS で解く。
+  ライブラリは足さない。完全な多重共線性の列はコレスキー分解で見つけて外し、理由を出す。
+  説明変数は 12 列まで。集計は重いのでタブを開いている間だけクライアントを繋ぐ。
+  目的変数の初期値は散布図の Y。numpy の最小二乗と係数・標準誤差・R² が一致することを確認済み。
 - **機械学習の結果は新しいチャートではなく列として書き戻す**（クラスタ・主成分得点）。
   既存の色分け・軸の選択肢に加わり、そのままクロスフィルタが効くようにするため。
 

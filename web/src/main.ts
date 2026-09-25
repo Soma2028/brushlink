@@ -51,6 +51,8 @@ import { createMLPanel } from './mlPanel';
 import { createHClustPanel } from './hclustPanel';
 import type { HClustPanel } from './hclustPanel';
 import type { MLPanel, MLTab, AddedColumns } from './mlPanel';
+import { createMultiRegressionPanel } from './multiRegression';
+import type { MultiRegressionPanel } from './multiRegression';
 import { composeFigure, downloadPng, downloadSvg } from './export';
 import { predicateSql } from './sql';
 import { settledMirror } from './settle';
@@ -181,6 +183,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         <div class="tabs" role="tablist" aria-label="詳細">
           <button type="button" role="tab" data-tab="stats" aria-selected="true">統計量</button>
           <button type="button" role="tab" data-tab="categories" aria-selected="false">カテゴリ構成</button>
+          <button type="button" role="tab" data-tab="mreg" aria-selected="false">重回帰</button>
           <span class="tab-sep">機械学習</span>
           <button type="button" role="tab" data-tab="cluster" aria-selected="false">クラスタ</button>
           <button type="button" role="tab" data-tab="pca" aria-selected="false">主成分</button>
@@ -194,6 +197,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           <div id="statsTable" class="table-scroll"></div>
         </div>
         <div role="tabpanel" data-panel="categories" hidden><div id="categoryPanel"></div></div>
+        <div role="tabpanel" data-panel="mreg" hidden><div id="mregPanel" class="ml-panel"></div></div>
         <div role="tabpanel" data-panel="cluster" hidden><div id="clusterPanel" class="ml-panel"></div></div>
         <div role="tabpanel" data-panel="pca" hidden><div id="pcaPanel" class="ml-panel"></div></div>
         <div role="tabpanel" data-panel="importance" hidden><div id="importancePanel" class="ml-panel"></div></div>
@@ -224,6 +228,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         <dt>効果量 d</dt><dd>2つの群の平均の差を標準偏差で割った値。単位の違う列どうしで「どれだけ違うか」を比べられます。0.2 小・0.5 中・0.8 大が目安。</dd>
         <dt>p 値</dt><dd>その差が偶然で生じる確率の目安。0.05 未満なら「偶然とは考えにくい」とされます。件数が多いと小さな差でも小さくなるので、効果量と合わせて見ます。</dd>
         <dt>回帰直線・R²</dt><dd>点に最もよく当てはまる直線。R² は直線で説明できるばらつきの割合（0〜1）。</dd>
+        <dt>重回帰・標準化係数 β</dt><dd>1つの列を複数の列の組み合わせで説明する式。β は列を平均0・SD1に揃えたときの係数で、単位の違う列どうしで効き方の強さを比べられます。</dd>
         <dt>クラスタ（k-means）</dt><dd>似た行どうしを自動でグループ分けする方法。結果は列として追加でき、色分けに使えます。</dd>
         <dt>主成分（PCA）</dt><dd>多くの列を少数の軸にまとめる方法。結果を散布図の軸にすると、全体の構造を一枚で眺められます。</dd>
         <dt>変数重要度</dt><dd>選んだ行を残りと見分けるのに、どの列が役立つかの順位（ランダムフォレスト）。</dd>
@@ -300,11 +305,12 @@ function setChartStatus(message: string, isError: boolean) {
 // 詳細カードのタブ
 // ---------------------------------------------------------------------------
 
-type DetailTab = 'stats' | 'categories' | 'rows' | 'hclust' | MLTab;
+type DetailTab = 'stats' | 'categories' | 'mreg' | 'rows' | 'hclust' | MLTab;
 let activeTab: DetailTab = 'stats';
 // ファイルを読み込むたびに作り直す。タブ切り替えから機械学習の計算を起動するため
 let mlPanel: MLPanel | null = null;
 let hclustPanel: HClustPanel | null = null;
+let mregPanel: MultiRegressionPanel | null = null;
 
 function isMLTab(tab: DetailTab): tab is MLTab {
   return tab === 'cluster' || tab === 'pca' || tab === 'importance';
@@ -320,6 +326,8 @@ function selectTab(tab: DetailTab) {
   });
   // 機械学習は重いので、そのタブを開いている間だけ計算する
   mlPanel?.setActive(isMLTab(tab) ? tab : null);
+  // 重回帰も、開いている間だけ集計する（列が多いと集計が重いため）
+  mregPanel?.setActive(tab === 'mreg');
 }
 
 detailCardEl.querySelectorAll<HTMLButtonElement>('[role="tab"]').forEach((b) => {
@@ -493,6 +501,7 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
   rowsPanelEl.innerHTML = '';
   mlPanel = null;
   hclustPanel = null;
+  mregPanel = null;
 
   db.clear(); // 古いチャート・集計クライアントを切断する（既定で clients・cache とも true）
 
@@ -641,6 +650,7 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
     // 散布図ごとの回帰（「選択中」の行を出すかどうかが選択の有無で変わる）
     grid?.refreshRegression();
     mlPanel?.scopeChanged();
+    mregPanel?.refresh();
     hclustPanel?.refreshScope();
     hclustPanel?.refreshSelection();
   }
@@ -757,6 +767,7 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
     await db.preaggregator.dropSchema();
     db.clear({ clients: false, cache: true });
     connectRows();
+    mregPanel?.setColumns(kinds.numeric, added.numeric);
     // クラスタの列はカテゴリなので、絞り込みにも加える（同じ列なら作り直す）
     for (const c of added.categorical) await panel.setCategoryColumn(c);
     // 結果を最初の散布図に反映する（無ければ散布図を1枚足す）
@@ -797,6 +808,16 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
     getScope: analysisScope,
     onColumnsAdded: handleColumnsAdded,
   });
+  mregPanel = createMultiRegressionPanel({
+    db,
+    tableName: table.tableName,
+    container: $<HTMLElement>('#mregPanel'),
+    numericCols: kinds.numeric,
+    population: $populationSettled,
+    selected: $selectedSettled,
+    hasSelection,
+    brushedCols: () => describeBrush($brush).cols,
+  });
   selectTab(activeTab);
 
   connectAnalysisClients();
@@ -809,6 +830,8 @@ async function setupDashboard(db: Coordinator, table: LoadedTable, fileName: str
     if (cols.numericCols.length >= 2) {
       const pair = await pickBestAxisPair(db, table.tableName, cols.numericCols);
       bestPair = pair;
+      // 重回帰の目的変数も散布図の Y に揃える（散布図で見ている関係の続きとして読めるように）
+      mregPanel?.setDefaultTarget(pair.y);
       if (pair.r !== null) {
         state.axisNote = `散布図の軸は、相関がいちばん強い「${escapeHtml(pair.x)}」と「${escapeHtml(pair.y)}」（相関係数 r = ${pair.r.toFixed(2)}）を自動で選びました。`;
       }

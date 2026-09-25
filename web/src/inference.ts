@@ -106,6 +106,18 @@ export function correlationPValue(r: number, n: number): number | null {
   return clampP(2 * (1 - jStat.studentt.cdf(Math.abs(t), n - 2)));
 }
 
+/** 重回帰の各係数が 0 かどうかの t 検定の p 値（両側）。 */
+export function tPValue(t: number, df: number): number | null {
+  if (!(df > 0) || !Number.isFinite(t)) return null;
+  return clampP(2 * (1 - jStat.studentt.cdf(Math.abs(t), df)));
+}
+
+/** 重回帰の「どの係数も 0」という仮説の F 検定の p 値。 */
+export function fPValue(f: number, df1: number, df2: number): number | null {
+  if (!(df1 > 0) || !(df2 > 0) || !Number.isFinite(f)) return null;
+  return clampP(1 - jStat.centralF.cdf(f, df1, df2));
+}
+
 function clampP(p: number): number {
   return Math.min(1, Math.max(0, p));
 }
