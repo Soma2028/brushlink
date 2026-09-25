@@ -80,6 +80,14 @@ export const scatter = (page: Page) => plotSvg(page, 'scatter');
 // 初期表示では散布図の X 軸の列のヒストグラムが最初のヒストグラム
 export const histX = (page: Page) => plotSvg(page, 'histogram');
 
+/**
+ * 点のグラフの、色付きの層（選択中）の点の数。点のグラフは母集団（灰）→ 選択中
+ * （色付き）の順に dot の層を重ねているので、2つ目の層の点を数える。
+ */
+export async function selectedDotCount(svg: Locator): Promise<number> {
+  return svg.locator('g[aria-label="dot"]').nth(1).locator('circle').count();
+}
+
 /** カードの設定（X・Y・種類・色など）の select。 */
 export const control = (page: Page, type: string, role: string, n = 0) => card(page, type, n).locator(`[data-role="${role}"]`);
 

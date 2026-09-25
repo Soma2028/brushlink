@@ -1,7 +1,7 @@
 // クロスフィルタの中核: 読み込み → ドラッグ選択 → 件数・統計・回帰・要約の連動。
 
 import { test, expect } from '@playwright/test';
-import { loadSample, countOf, drag, scatter, histX, waitForSelection, parseCount, card, control } from './helpers';
+import { loadSample, countOf, drag, scatter, histX, waitForSelection, parseCount, card, control, selectedDotCount } from './helpers';
 
 test.beforeEach(async ({ page }) => {
   await loadSample(page);
@@ -38,6 +38,22 @@ test('散布図をドラッグすると、件数・要約・統計・回帰が�
   // 散布図の範囲選択は X・Y 両方の範囲条件なので、軸の列が欠測の行は
   // 選択に入らない。よって回帰の n は選択件数とちょうど一致するはず
   expect(selectedN).toBe(selected);
+});
+
+test('散布図をドラッグすると、その散布図自身でも枠の中の点だけが色付きで残る', async ({ page }) => {
+  // 以前は crossfilter の仕様で、自分で囲んだ範囲が自分の点に効かず、
+  // 全部の点が色付きのままで枠でしか選択が分からなかった
+  const before = await selectedDotCount(scatter(page));
+  expect(before).toBeGreaterThan(2000);
+  await drag(page, scatter(page), [0.55, 0.45], [0.95, 0.9]);
+  const selected = await waitForSelection(page);
+  await expect.poll(() => selectedDotCount(scatter(page))).toBe(selected);
+  // 選択外の点も灰色の層に残っている（全体の中のどこを選んだかが見える）
+  expect(await scatter(page).locator('g[aria-label="dot"]').first().locator('circle').count()).toBe(before);
+
+  // 解除すると全部の点が色付きに戻る
+  await page.keyboard.press('Escape');
+  await expect.poll(() => selectedDotCount(scatter(page))).toBe(before);
 });
 
 test('ヒストグラムのドラッグでも選択でき、Esc と解除ボタンで解除できる', async ({ page }) => {

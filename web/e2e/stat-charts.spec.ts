@@ -3,7 +3,7 @@
 
 import { test, expect } from '@playwright/test';
 import type { Page } from '@playwright/test';
-import { loadSample, card, control, plotSvg, drag, waitForSelection, countOf } from './helpers';
+import { loadSample, card, control, plotSvg, drag, waitForSelection, countOf, selectedDotCount } from './helpers';
 
 /** 最後のカードの X・Y・種類を設定する（「グラフを追加」した直後に使う）。 */
 async function addChart(page: Page, x: string, y: string | null, type: string) {
@@ -118,6 +118,8 @@ test('残差プロットで四角くドラッグすると選択できる', async
   const selected = await waitForSelection(page);
   expect(selected).toBeGreaterThan(0);
   expect(selected).toBeLessThan(3000);
+  // 残差プロット自身でも、枠の中の点だけが色付きで残る
+  await expect.poll(() => selectedDotCount(plotSvg(page, 'residual'))).toBe(selected);
 });
 
 test('選択の結果が0行になっても、密度表示（raster）のグラフでエラーにならない', async ({ page }) => {

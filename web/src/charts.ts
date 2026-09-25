@@ -3,8 +3,8 @@
 // chartTypes.ts、画面への並べ方は chartGrid.ts。
 //
 // どの種類も同じ2層構成にしてある: 灰色の層が母集団（$filter のみで絞る）、
-// 色付きの層が選択中（$brush で絞る。カテゴリのグラフだけは $selected で、
-// 理由は CategoryChartContext に書いた）。選択の操作は、数値の軸なら範囲の
+// 色付きの層が選択中（$brush で絞る。ただしカテゴリのグラフと点で描く散布図は
+// $selected で、理由は CategoryChartContext と selectedLayer に書いた）。選択の操作は、数値の軸なら範囲の
 // ドラッグ（intervalX / intervalXY）、カテゴリの軸ならクリック（toggleX）で、
 // どちらも $brush に書き込むので、すべてのグラフと統計量が連動する。
 //
@@ -158,6 +158,23 @@ const BRUSH_STYLE = { fill: ACCENT_FILL, fillOpacity: 0.07, stroke: ACCENT_FILL,
 const POPULATION_STROKE = '#9aa3b2';
 
 
+/**
+ * 点のグラフ（散布図・残差プロット・散布図行列のマス）の色付きの層のデータ。
+ *
+ * $brush ではなく $selected（intersect）で絞る。crossfilter の $brush は
+ * 「自分のグラフで囲んだ範囲を自分には効かせない」ので、散布図をドラッグしても
+ * 自分の点は全部色付きのままで、枠でしか選択が分からなかった。intersect なら
+ * 枠の中の点だけが色付きで残り、枠の外は灰色になる（他のグラフで選んだときと
+ * 同じ見え方。カテゴリのグラフの CategoryChartContext と同じ考え方）。
+ * ドラッグ中に自分の点も描き直すことになるが、描くのは dot のとき（15,000 行
+ * 未満）だけで、他のグラフをドラッグしたときに散布図が描き直す量と同じになる。
+ * raster は1層で、選択外を灰色で残す背景の層が無いため、ここを使わず $brush のまま
+ * （自分で囲んだ範囲の外が消えると、全体の中のどこを選んだかが見えなくなる）。
+ */
+function selectedLayer(tableName: string, selectedLive: Selection) {
+  return from(tableName, { filterBy: selectedLive });
+}
+
 export interface ScatterConfig {
   tableName: string;
   x: string;
@@ -170,7 +187,10 @@ export interface ScatterConfig {
   population: Selection; // フィルタ後の母集団（$filter）
   brush: Selection; // チャート間のマーキング（$brush、crossfilter）
   // 散布図自身の範囲選択も含めた選択（$selected、intersect）。回帰直線用
+  // （ドラッグが止まってから追従するミラー）
   selected: Selection;
+  // 同じ条件の即時版。点の色付きの層に使う（理由は buildScatterPlot）
+  selectedLive: Selection;
   showRegression: boolean;
   plotName: string; // 凡例を紐づけるための名前
   width: number;
@@ -182,17 +202,15 @@ export interface ScatterConfig {
  * raster、未満なら dot。ユーザーに選ばせる UI は作らない。
  *
  * dot のときは2層にする: 背景に母集団（$filter のみ）を灰色で、前景に
- * マーキング後（$brush）を色付きで重ねる。こうすると他のチャートで
- * 選択したとき、散布図上では「選ばれた点が色付きで浮き上がる」表示になる。
+ * 選択中の点を色付きで重ねる。こうすると他のチャートで選択したとき、
+ * 散布図上では「選ばれた点が色付きで浮き上がる」表示になる。
  * raster は2層重ねると下の層が完全に隠れるうえ描画コストが倍になるため、
  * 1層のままにする（大規模データでは応答速度を優先する）。
  */
 export function buildScatterPlot(cfg: ScatterConfig): HTMLElement {
   const useRaster = cfg.rowCount >= DOT_TO_RASTER_THRESHOLD;
-  const fg = from(cfg.tableName, { filterBy: cfg.brush });
-
   const marks = useRaster
-    ? [raster(fg, { x: cfg.x, y: cfg.y, pixelSize: 2 })]
+    ? [raster(from(cfg.tableName, { filterBy: cfg.brush }), { x: cfg.x, y: cfg.y, pixelSize: 2 })]
     : [
         dot(from(cfg.tableName, { filterBy: cfg.population }), {
           x: cfg.x,
@@ -200,7 +218,7 @@ export function buildScatterPlot(cfg: ScatterConfig): HTMLElement {
           fill: BACKGROUND_FILL,
           r: 2.5,
         }),
-        dot(fg, {
+        dot(selectedLayer(cfg.tableName, cfg.selectedLive), {
           x: cfg.x,
           y: cfg.y,
           fill: cfg.colorCol ?? ACCENT_FILL,
@@ -439,6 +457,7 @@ export interface ResidualContext {
   rowCount: number;
   population: Selection;
   brush: Selection;
+  selectedLive: Selection; // 点の色付きの層用（buildScatterPlot と同じ理由）
   size: { width: number; height: number };
 }
 
@@ -458,12 +477,11 @@ export function buildResidual(
 ): HTMLElement {
   const residual = sql`${col(y)} - (${fit.slope} * ${col(x)} + ${fit.intercept})`;
   const useRaster = ctx.rowCount >= DOT_TO_RASTER_THRESHOLD;
-  const fg = from(ctx.tableName, { filterBy: ctx.brush });
   const marks = useRaster
-    ? [raster(fg, { x, y: residual, pixelSize: 2 })]
+    ? [raster(from(ctx.tableName, { filterBy: ctx.brush }), { x, y: residual, pixelSize: 2 })]
     : [
         dot(from(ctx.tableName, { filterBy: ctx.population }), { x, y: residual, fill: BACKGROUND_FILL, r: 2.5 }),
-        dot(fg, { x, y: residual, fill: ACCENT_FILL, r: 2.5, fillOpacity: 0.8 }),
+        dot(selectedLayer(ctx.tableName, ctx.selectedLive), { x, y: residual, fill: ACCENT_FILL, r: 2.5, fillOpacity: 0.8 }),
       ];
   return plot(
     // 残差0の基準線は先に描く。interactor（intervalXY）は直前のマークの列を
@@ -484,6 +502,7 @@ export interface SplomContext {
   rowCount: number;
   population: Selection;
   brush: Selection;
+  selectedLive: Selection; // 散布図のマスの色付きの層用（buildScatterPlot と同じ理由）
   width: number;
 }
 
@@ -535,12 +554,11 @@ export function buildSplom(columns: string[], ctx: SplomContext): { element: HTM
           yLabel(null)
         );
       } else {
-        const fg = from(ctx.tableName, { filterBy: ctx.brush });
         const marks = useRaster
-          ? [raster(fg, { x: xCol, y: yCol, pixelSize: 2 })]
+          ? [raster(from(ctx.tableName, { filterBy: ctx.brush }), { x: xCol, y: yCol, pixelSize: 2 })]
           : [
               dot(from(ctx.tableName, { filterBy: ctx.population }), { x: xCol, y: yCol, fill: BACKGROUND_FILL, r: 1.5 }),
-              dot(fg, { x: xCol, y: yCol, fill: ACCENT_FILL, r: 1.5, fillOpacity: 0.8 }),
+              dot(selectedLayer(ctx.tableName, ctx.selectedLive), { x: xCol, y: yCol, fill: ACCENT_FILL, r: 1.5, fillOpacity: 0.8 }),
             ];
         el = plot(...marks, intervalXY({ as: ctx.brush, brush: BRUSH_STYLE }), ...common);
       }

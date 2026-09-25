@@ -307,6 +307,7 @@ class ChartCard {
           population,
           brush,
           selected: this.ctx.selected,
+          selectedLive: this.ctx.selectedLive,
           showRegression: c.regression,
           plotName,
           width: size.width,
@@ -346,6 +347,7 @@ class ChartCard {
           rowCount: this.ctx.rowCount,
           population,
           brush,
+          selectedLive: this.ctx.selectedLive,
           width: size.width,
         });
         content = splom.element;
@@ -359,7 +361,14 @@ class ChartCard {
           this.body.innerHTML = '<p class="chart-empty">回帰直線を当てはめられません（値が2件未満か、X が一定）。</p>';
           return;
         }
-        plotEl = buildResidual(c.x, c.y!, fit, { tableName, rowCount: this.ctx.rowCount, population, brush, size });
+        plotEl = buildResidual(c.x, c.y!, fit, {
+          tableName,
+          rowCount: this.ctx.rowCount,
+          population,
+          brush,
+          selectedLive: this.ctx.selectedLive,
+          size,
+        });
         this.watchFit(c.x, c.y!, fit);
         break;
       }
